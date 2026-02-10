@@ -70,7 +70,7 @@ export class ProxyManager {
       `-v ${CONTAINER}-config:/data`,
       `-e SECRET=${secretsStr}`,
       tagArg,
-      'telegrammessenger/proxy:latest',
+      'ghcr.io/skrashevich/mtproxy:latest',
     ]
       .filter(Boolean)
       .join(' ');
