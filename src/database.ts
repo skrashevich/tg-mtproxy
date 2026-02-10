@@ -13,6 +13,13 @@ const db: InstanceType<typeof Database> = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
+function ensureColumn(table: string, column: string, definition: string) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!columns.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
 // ─── Инициализация таблиц ───
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
@@ -22,6 +29,7 @@ db.exec(`
     secret          TEXT UNIQUE NOT NULL,
     expires_at      TEXT,  -- ISO datetime
     max_connections  INTEGER DEFAULT 1,
+    trial_used      INTEGER DEFAULT 0,
     is_active       INTEGER DEFAULT 0,
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now'))
@@ -45,6 +53,9 @@ db.exec(`
     created_at      TEXT DEFAULT (datetime('now'))
   );
 `);
+
+// Миграция для существующих БД
+ensureColumn('users', 'trial_used', 'INTEGER DEFAULT 0');
 
 // ─── Подготовленные запросы ───
 
@@ -76,9 +87,19 @@ export const queries: Record<string, any> = {
     WHERE telegram_id = ?
   `),
 
+  activateUser: db.prepare(`
+    UPDATE users SET is_active = 1, updated_at = datetime('now')
+    WHERE telegram_id = ?
+  `),
+
+  markTrialUsed: db.prepare(`
+    UPDATE users SET trial_used = 1, updated_at = datetime('now')
+    WHERE telegram_id = ?
+  `),
+
   getExpiredUsers: db.prepare(`
     SELECT * FROM users
-    WHERE is_active = 1 AND expires_at < datetime('now')
+    WHERE is_active = 1 AND julianday(expires_at) < julianday('now')
   `),
 
   // Платежи
