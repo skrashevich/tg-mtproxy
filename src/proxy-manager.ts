@@ -96,7 +96,11 @@ export class ProxyManager {
   }
 
   /** Получает статистику подключений из контейнера */
-  async getStats(): Promise<{ connections: number; maxConnections: number } | null> {
+  async getStats(): Promise<{
+    connections: number;
+    maxConnections: number;
+    secretConnections: Record<number, number>;
+  } | null> {
     try {
       const result = execSync(
         `docker exec ${CONTAINER} curl -s http://localhost:2398/stats 2>/dev/null`,
@@ -104,16 +108,32 @@ export class ProxyManager {
       ).toString();
 
       const lines = result.split('\n');
-      let connections = 0;
+      let totalConnections = 0;
       let maxConnections = 0;
+      const secretConnections: Record<number, number> = {};
+      let hasSecretConnections = false;
 
       for (const line of lines) {
         const [key, value] = line.split('\t');
-        if (key === 'total_special_connections') connections = parseInt(value) || 0;
+        if (!key || value === undefined) continue;
+
+        if (key === 'total_special_connections') totalConnections = parseInt(value) || 0;
         if (key === 'total_max_special_connections') maxConnections = parseInt(value) || 0;
+
+        const match = key.match(/^secret_(\d+)_active_connections$/);
+        if (match) {
+          const index = parseInt(match[1], 10);
+          const connections = parseInt(value) || 0;
+          secretConnections[index] = connections;
+          hasSecretConnections = true;
+        }
       }
 
-      return { connections, maxConnections };
+      const connections = hasSecretConnections
+        ? Object.values(secretConnections).reduce((sum, count) => sum + count, 0)
+        : totalConnections;
+
+      return { connections, maxConnections, secretConnections };
     } catch {
       return null;
     }

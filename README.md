@@ -91,6 +91,7 @@ sudo journalctl -u mtproxy-bot -f
 Бесплатный триал настраивается через `.env`:
 - `TRIAL_DAYS` — длительность в днях (`0` = выключен)
 - `TRIAL_MAX_CONNECTIONS` — лимит устройств в триале
+- `TRIAL_NOTIFY_ADMIN` — уведомления админу о выдаче триала (`1`/`0`)
 
 ## Лимиты для 1 ГБ RAM + 200 Мбит
 
@@ -120,6 +121,7 @@ sudo journalctl -u mtproxy-bot -f
 - `/block <id>` — деактивировать
 - `/restart_proxy` — перезапустить MTProxy
 - `/toggle_sales` — вкл/выкл продажи
+- `/toggle_trial_notify` — вкл/выкл уведомления о выдаче триала
 
 ## Структура
 

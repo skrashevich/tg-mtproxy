@@ -13,11 +13,9 @@ const db: InstanceType<typeof Database> = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
-function ensureColumn(table: string, column: string, definition: string) {
+function hasColumn(table: string, column: string): boolean {
   const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
-  if (!columns.some((c) => c.name === column)) {
-    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-  }
+  return columns.some((c) => c.name === column);
 }
 
 // ─── Инициализация таблиц ───
@@ -29,7 +27,6 @@ db.exec(`
     secret          TEXT UNIQUE NOT NULL,
     expires_at      TEXT,  -- ISO datetime
     max_connections  INTEGER DEFAULT 1,
-    trial_used      INTEGER DEFAULT 0,
     is_active       INTEGER DEFAULT 0,
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now'))
@@ -54,8 +51,53 @@ db.exec(`
   );
 `);
 
-// Миграция для существующих БД
-ensureColumn('users', 'trial_used', 'INTEGER DEFAULT 0');
+// ─── Миграции ───
+db.exec(`
+  CREATE TABLE IF NOT EXISTS schema_migrations (
+    id              TEXT PRIMARY KEY,
+    applied_at      TEXT DEFAULT (datetime('now'))
+  );
+`);
+
+const hasMigration = db.prepare(`SELECT 1 FROM schema_migrations WHERE id = ?`);
+const insertMigration = db.prepare(`INSERT INTO schema_migrations (id) VALUES (?)`);
+
+type Migration = {
+  id: string;
+  up: () => void;
+};
+
+const migrations: Migration[] = [
+  {
+    id: '20260211_add_users_trial_used',
+    up: () => {
+      if (!hasColumn('users', 'trial_used')) {
+        db.exec(`ALTER TABLE users ADD COLUMN trial_used INTEGER DEFAULT 0`);
+      }
+    },
+  },
+  {
+    id: '20260211_create_settings_table',
+    up: () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS settings (
+          key             TEXT PRIMARY KEY,
+          value           TEXT NOT NULL,
+          updated_at      TEXT DEFAULT (datetime('now'))
+        );
+      `);
+    },
+  },
+];
+
+for (const migration of migrations) {
+  if (hasMigration.get(migration.id)) continue;
+
+  db.transaction(() => {
+    migration.up();
+    insertMigration.run(migration.id);
+  })();
+}
 
 // ─── Подготовленные запросы ───
 
@@ -63,7 +105,7 @@ export const queries: Record<string, any> = {
   // Пользователи
   getUser: db.prepare(`SELECT * FROM users WHERE telegram_id = ?`),
   getUserBySecret: db.prepare(`SELECT * FROM users WHERE secret = ?`),
-  getAllActiveUsers: db.prepare(`SELECT * FROM users WHERE is_active = 1`),
+  getAllActiveUsers: db.prepare(`SELECT * FROM users WHERE is_active = 1 ORDER BY id ASC`),
   getActiveUsersCount: db.prepare(`SELECT COUNT(*) as count FROM users WHERE is_active = 1`),
   getTotalUsersCount: db.prepare(`SELECT COUNT(*) as count FROM users`),
 
@@ -120,6 +162,19 @@ export const queries: Record<string, any> = {
   // Алерты
   insertAlert: db.prepare(`
     INSERT INTO alerts (type, message) VALUES (?, ?)
+  `),
+
+  // Настройки
+  getSetting: db.prepare(`
+    SELECT value FROM settings WHERE key = ?
+  `),
+
+  upsertSetting: db.prepare(`
+    INSERT INTO settings (key, value, updated_at)
+    VALUES (@key, @value, datetime('now'))
+    ON CONFLICT(key) DO UPDATE SET
+      value = excluded.value,
+      updated_at = datetime('now')
   `),
 };
 

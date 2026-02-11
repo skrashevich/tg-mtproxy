@@ -15,6 +15,7 @@ const RAM_STOP = parseInt(process.env.RAM_STOP_PERCENT || '90');
 const TRIAL_DAYS = parseInt(process.env.TRIAL_DAYS || '0');
 const TRIAL_MAX_CONNECTIONS = parseInt(process.env.TRIAL_MAX_CONNECTIONS || '1');
 const TRIAL_ENABLED = TRIAL_DAYS > 0;
+const TRIAL_NOTIFY_ADMIN_DEFAULT = process.env.TRIAL_NOTIFY_ADMIN !== '0';
 
 if (!BOT_TOKEN || !ADMIN_ID) {
   console.error('❌ BOT_TOKEN и ADMIN_ID обязательны в .env');
@@ -26,6 +27,14 @@ const proxy = new ProxyManager();
 
 // Флаг: заблокирована ли продажа (перегрузка)
 let salesBlocked = false;
+
+function loadTrialNotifySetting(): boolean {
+  const row = queries.getSetting.get('trial_notify_enabled') as any;
+  if (!row) return TRIAL_NOTIFY_ADMIN_DEFAULT;
+  return row.value === '1';
+}
+
+let trialNotifyEnabled = loadTrialNotifySetting();
 
 function getCapacityState(userId: number): { existingUser: any; activeCount: number; canActivate: boolean } {
   const existingUser = queries.getUser.get(userId) as any;
@@ -194,12 +203,14 @@ async function startTrial(ctx: Context) {
     { parse_mode: 'Markdown' }
   );
 
-  await notifyAdmin(
-    `🎁 Выдан триал\n` +
-      `Пользователь: @${ctx.from!.username || userId}\n` +
-      `Срок: ${TRIAL_DAYS} дн.\n` +
-      `Активных: ${activeCount + 1}/${MAX_USERS}`
-  );
+  if (trialNotifyEnabled) {
+    await notifyAdmin(
+      `🎁 Выдан триал\n` +
+        `Пользователь: @${ctx.from!.username || userId}\n` +
+        `Срок: ${TRIAL_DAYS} дн.\n` +
+        `Активных: ${activeCount + 1}/${MAX_USERS}`
+    );
+  }
 }
 
 // ─── Статус подписки ───
@@ -474,7 +485,8 @@ bot.command('admin', async (ctx) => {
       '/block <tg_id> — деактивировать юзера\n' +
       '/unblock <tg_id> — активировать юзера\n' +
       '/restart_proxy — перезапустить прокси\n' +
-      '/toggle_sales — вкл/выкл продажи'
+      '/toggle_sales — вкл/выкл продажи\n' +
+      '/toggle_trial_notify — вкл/выкл уведомления о триале'
   );
 });
 
@@ -511,9 +523,11 @@ bot.command('users', async (ctx) => {
     return ctx.reply('Нет активных пользователей.');
   }
 
+  const proxyStats = await proxy.getStats();
   const lines = users.map((u, i) => {
     const days = Math.ceil((new Date(u.expires_at).getTime() - Date.now()) / 86400000);
-    return `${i + 1}. @${u.username || u.telegram_id} — ${days}дн, ${u.max_connections} устр.`;
+    const sessions = proxyStats ? (proxyStats.secretConnections[i + 1] ?? 0) : 'н/д';
+    return `${i + 1}. @${u.username || u.telegram_id} — ${days}дн, ${u.max_connections} устр., сессий: ${sessions}`;
   });
 
   await ctx.reply(`👥 Активные пользователи (${users.length}):\n\n${lines.join('\n')}`);
@@ -593,6 +607,18 @@ bot.command('toggle_sales', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
   salesBlocked = !salesBlocked;
   await ctx.reply(`Продажи: ${salesBlocked ? '⛔ ЗАБЛОКИРОВАНЫ' : '✅ ОТКРЫТЫ'}`);
+});
+
+bot.command('toggle_trial_notify', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return;
+  trialNotifyEnabled = !trialNotifyEnabled;
+  queries.upsertSetting.run({
+    key: 'trial_notify_enabled',
+    value: trialNotifyEnabled ? '1' : '0',
+  });
+  await ctx.reply(
+    `Уведомления о выдаче триала: ${trialNotifyEnabled ? '✅ ВКЛЮЧЕНЫ' : '⛔ ОТКЛЮЧЕНЫ'}`
+  );
 });
 
 // ═══════════════════════════════════════════════
@@ -731,6 +757,7 @@ export function startBot() {
   console.log(`👑 Админ: ${ADMIN_ID}`);
   console.log(`📦 Лимит: ${MAX_USERS} юзеров`);
   console.log(`🎁 Триал: ${TRIAL_ENABLED ? `${TRIAL_DAYS} дн, ${TRIAL_MAX_CONNECTIONS} устр.` : 'выключен'}`);
+  console.log(`🔔 Уведомления о триале: ${trialNotifyEnabled ? 'включены' : 'отключены'}`);
 
   // Graceful stop
   process.once('SIGINT', () => bot.stop('SIGINT'));
