@@ -734,6 +734,15 @@ function formatDate(isoDate: string): string {
   });
 }
 
+bot.telegram.setMyCommands([
+  { command: 'start', description: 'Начало' },
+  { command: 'tariffs', description: 'Тарифы' },
+  ...(TRIAL_ENABLED ? [{ command: 'trial', description: 'Бесплатный триал' }] : []),
+  { command: 'link', description: 'Моя ссылка' },
+  { command: 'status', description: 'Статус подписки' },
+  { command: 'help', description: 'Справка' },
+]);
+
 // ─── Помощь ───
 bot.help((ctx) => {
   ctx.reply(
