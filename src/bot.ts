@@ -27,6 +27,13 @@ const proxy = new ProxyManager();
 
 // Флаг: заблокирована ли продажа (перегрузка)
 let salesBlocked = false;
+let salesBlockReason: 'manual' | 'ram' | null = null;
+
+function formatSalesState() {
+  if (!salesBlocked) return '✅ открыты';
+  if (salesBlockReason === 'manual') return '⛔ заблокированы (вручную)';
+  return '⛔ заблокированы (RAM)';
+}
 
 function loadTrialNotifySetting(): boolean {
   const row = queries.getSetting.get('trial_notify_enabled') as any;
@@ -511,7 +518,7 @@ bot.command('stats', async (ctx) => {
       `   RAM: ${ram}%\n` +
       `   Proxy: ${running ? '✅ работает' : '❌ остановлен'}\n` +
       `   Подключений: ${proxyStats?.connections ?? '?'}\n` +
-      `   Продажи: ${salesBlocked ? '⛔ заблокированы' : '✅ открыты'}`
+      `   Продажи: ${formatSalesState()}`
   );
 });
 
@@ -605,8 +612,15 @@ bot.command('restart_proxy', async (ctx) => {
 
 bot.command('toggle_sales', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
-  salesBlocked = !salesBlocked;
-  await ctx.reply(`Продажи: ${salesBlocked ? '⛔ ЗАБЛОКИРОВАНЫ' : '✅ ОТКРЫТЫ'}`);
+  if (salesBlocked) {
+    salesBlocked = false;
+    salesBlockReason = null;
+  } else {
+    salesBlocked = true;
+    salesBlockReason = 'manual';
+  }
+
+  await ctx.reply(`Продажи: ${formatSalesState().toUpperCase()}`);
 });
 
 bot.command('toggle_trial_notify', async (ctx) => {
@@ -668,14 +682,16 @@ cron.schedule('*/5 * * * *', async () => {
   // RAM алерты
   if (ram > RAM_STOP && !salesBlocked) {
     salesBlocked = true;
+    salesBlockReason = 'ram';
     await notifyAdmin(
       `🔴 RAM ${ram}% > ${RAM_STOP}%!\nПродажи автоматически заблокированы.`
     );
   } else if (ram > RAM_WARN) {
     await notifyAdmin(`🟡 RAM ${ram}% — приближаемся к лимиту.`);
-  } else if (ram < RAM_WARN && salesBlocked) {
+  } else if (ram < RAM_WARN && salesBlocked && salesBlockReason === 'ram') {
     // Автоматически разблокируем если RAM снизилась
     salesBlocked = false;
+    salesBlockReason = null;
     await notifyAdmin(`🟢 RAM ${ram}%, продажи автоматически разблокированы.`);
   }
 
