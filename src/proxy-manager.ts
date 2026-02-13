@@ -41,57 +41,114 @@ export class ProxyManager {
   }
 
   /**
-   * Пересоздаёт контейнер со всеми активными секретами.
-   * Вызывается после добавления/удаления пользователя.
+   * Пересоздаёт контейнер с обновлённым образом.
+   * Делает docker pull, stop, rm, run — секреты берёт из БД.
+   * Возвращает { updated: true } если образ изменился.
    */
-  async restartWithSecrets(): Promise<void> {
+  async updateAndRestart(): Promise<{ updated: boolean; image: string }> {
+    // Определяем образ: из запущенного контейнера или из env/дефолта
+    let image: string;
+    try {
+      image = execSync(
+        `docker inspect -f '{{.Config.Image}}' ${CONTAINER}`,
+        { timeout: 5000 }
+      ).toString().trim();
+    } catch {
+      image = process.env.PROXY_IMAGE || 'ghcr.io/skrashevich/mtproxy:latest';
+    }
+
+    // Запоминаем текущий digest до pull
+    const digestBefore = this.getImageId(image);
+
+    // Тянем новый образ (может занять время)
+    console.log(`[ProxyManager] docker pull ${image}...`);
+    execSync(`docker pull ${image}`, { timeout: 120000, stdio: 'pipe' });
+
+    const digestAfter = this.getImageId(image);
+    const updated = digestBefore !== digestAfter;
+
+    // Берём активные секреты
     const activeUsers = queries.getAllActiveUsers.all() as any[];
     const secrets = activeUsers.map((u) => u.secret).filter(Boolean);
 
+    // Останавливаем и удаляем старый контейнер
+    try {
+      execSync(`docker stop -t 5 ${CONTAINER} 2>/dev/null; docker rm ${CONTAINER} 2>/dev/null`, {
+        timeout: 20000,
+      });
+    } catch { /* контейнер мог не существовать */ }
+
     if (secrets.length === 0) {
-      console.log('[ProxyManager] Нет активных секретов, останавливаем контейнер');
-      this.stopContainer();
-      return;
+      console.log('[ProxyManager] Нет активных секретов — контейнер не запущен');
+      return { updated, image };
     }
 
-    const secretsStr = secrets.join(',');
+    // Секреты уже записаны в volume (/data/secret) предыдущими вызовами restartWithSecrets.
+    // Именованный volume переживает rm+run, поэтому SECRET env не нужен.
     const tag = process.env.PROXY_TAG || '';
     const tagArg = tag ? `-e TAG=${tag}` : '';
-
-    // Останавливаем старый контейнер
-    this.stopContainer();
-
-    // Запускаем новый
     const cmd = [
       'docker run -d',
       `--name=${CONTAINER}`,
       '--restart=always',
       `-p ${this.proxyPort}:443`,
       `-v ${CONTAINER}-config:/data`,
-      `-e SECRET=${secretsStr}`,
       tagArg,
-      'ghcr.io/skrashevich/mtproxy:latest',
-    ]
-      .filter(Boolean)
-      .join(' ');
+      image,
+    ].filter(Boolean).join(' ');
 
+    execSync(cmd, { timeout: 30000 });
+    console.log(`[ProxyManager] Контейнер запущен: ${image} (${secrets.length} секретов)`);
+
+    return { updated, image };
+  }
+
+  private getImageId(image: string): string {
     try {
-      execSync(cmd, { timeout: 30000 });
-      console.log(`[ProxyManager] Контейнер запущен с ${secrets.length} секретами`);
-    } catch (err: any) {
-      console.error('[ProxyManager] Ошибка запуска:', err.message);
-      throw err;
+      return execSync(`docker image inspect -f '{{.Id}}' ${image} 2>/dev/null`, {
+        timeout: 5000,
+      }).toString().trim();
+    } catch {
+      return '';
     }
   }
 
-  /** Останавливает и удаляет контейнер */
-  private stopContainer(): void {
+  /**
+   * Обновляет секреты и перезапускает контейнер.
+   * Записывает секреты в файл volume, затем быстрый restart (~1-2 сек).
+   */
+  async restartWithSecrets(): Promise<void> {
+    const activeUsers = queries.getAllActiveUsers.all() as any[];
+    const secrets = activeUsers.map((u) => u.secret).filter(Boolean);
+
+    if (secrets.length === 0) {
+      console.log('[ProxyManager] Нет активных секретов');
+      return;
+    }
+
+    const secretsStr = secrets.join(',');
+
+    // Пишем секреты в файл volume
     try {
-      execSync(`docker stop ${CONTAINER} 2>/dev/null; docker rm ${CONTAINER} 2>/dev/null`, {
-        timeout: 15000,
-      });
-    } catch {
-      // Контейнер мог не существовать — ок
+      const volumePath = execSync(
+        `docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' ${CONTAINER}`,
+        { timeout: 5000 }
+      ).toString().trim();
+
+      if (volumePath) {
+        execSync(`printf '%s' '${secretsStr}' > ${volumePath}/secret`, { timeout: 3000 });
+      }
+    } catch (err: any) {
+      console.error('[ProxyManager] Ошибка записи секретов:', err.message);
+    }
+
+    // Быстрый restart (1-2 сек)
+    try {
+      execSync(`docker restart -t 1 ${CONTAINER}`, { timeout: 15000 });
+      console.log(`[ProxyManager] Рестарт с ${secrets.length} секретами`);
+    } catch (err: any) {
+      console.error('[ProxyManager] Ошибка рестарта:', err.message);
+      throw err;
     }
   }
 

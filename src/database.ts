@@ -141,7 +141,7 @@ export const queries: Record<string, any> = {
 
   getExpiredUsers: db.prepare(`
     SELECT * FROM users
-    WHERE is_active = 1 AND julianday(expires_at) < julianday('now')
+    WHERE is_active = 1 AND expires_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
   `),
 
   // Платежи

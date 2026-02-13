@@ -3,6 +3,7 @@ import { message } from 'telegraf/filters';
 import { queries } from './database';
 import { ProxyManager } from './proxy-manager';
 import { TARIFFS, getTariffById, formatTariffList } from './tariffs';
+import { formatTimeLeft } from './helpers';
 import cron from 'node-cron';
 
 // ─── Конфиг ───
@@ -97,7 +98,7 @@ bot.start(async (ctx) => {
     const webLink = proxy.buildWebLink(user.secret);
     return ctx.reply(
       `✅ У тебя есть активная подписка!\n\n` +
-        `Действует до: ${formatDate(user.expires_at)}\n\n` +
+        `Осталось: ${formatTimeLeft(user.expires_at)}\n\n` +
         `🔗 Ссылка:\n\`${link}\`\n\n` +
         `Или нажми: [Подключить](${webLink})`,
       { parse_mode: 'Markdown', ...Markup.inlineKeyboard([
@@ -231,12 +232,11 @@ async function showStatus(ctx: Context) {
   }
 
   const link = proxy.buildLink(user.secret);
-  const daysLeft = Math.max(0, Math.ceil((new Date(user.expires_at).getTime() - Date.now()) / 86400000));
 
   await ctx.reply(
     `📊 Твоя подписка:\n\n` +
       `Статус: ✅ Активна\n` +
-      `Осталось: ${daysLeft} дн.\n` +
+      `Осталось: ${formatTimeLeft(user.expires_at)}\n` +
       `До: ${formatDate(user.expires_at)}\n\n` +
       `🔗 Ссылка:\n\`${link}\``,
     { parse_mode: 'Markdown' }
@@ -492,6 +492,7 @@ bot.command('admin', async (ctx) => {
       '/block <tg_id> — деактивировать юзера\n' +
       '/unblock <tg_id> — активировать юзера\n' +
       '/restart_proxy — перезапустить прокси\n' +
+      '/update_proxy — обновить образ и перезапустить\n' +
       '/toggle_sales — вкл/выкл продажи\n' +
       '/toggle_trial_notify — вкл/выкл уведомления о триале'
   );
@@ -607,6 +608,18 @@ bot.command('restart_proxy', async (ctx) => {
     await ctx.reply('✅ Proxy контейнер перезапущен.');
   } catch (err: any) {
     await ctx.reply(`❌ Ошибка: ${err.message}`);
+  }
+});
+
+bot.command('update_proxy', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return;
+  await ctx.reply('⏳ Скачиваю новый образ...');
+  try {
+    const { updated, image } = await proxy.updateAndRestart();
+    const status = updated ? '✅ Образ обновлён и контейнер перезапущен.' : '✅ Образ уже актуален, контейнер перезапущен.';
+    await ctx.reply(`${status}\n\`${image}\``, { parse_mode: 'Markdown' });
+  } catch (err: any) {
+    await ctx.reply(`❌ Ошибка обновления: ${err.message}`);
   }
 });
 
