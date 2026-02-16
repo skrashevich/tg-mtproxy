@@ -101,7 +101,7 @@ bot.start(async (ctx) => {
         `Осталось: ${formatTimeLeft(user.expires_at)}\n\n` +
         `🔗 Ссылка:\n\`${link}\`\n\n` +
         `Или нажми: [Подключить](${webLink})`,
-      { parse_mode: 'Markdown', ...Markup.inlineKeyboard([
+      { parse_mode: 'Markdown', disable_web_page_preview: true, ...Markup.inlineKeyboard([
         [Markup.button.callback('🔄 Продлить', 'cmd_tariffs')],
         [Markup.button.callback('📊 Мой статус', 'cmd_status')],
       ])}
@@ -116,7 +116,7 @@ bot.start(async (ctx) => {
       'Оплата через Telegram Stars ⭐ — безопасно и моментально.' +
       '\n\nЭто некоммерческий проект, деньги в лучшем случае окупят аренду серверов.\n' +
       'Полный исходный код бота и сопутствующих систем доступен на https://github.com/skrashevich',
-    buildPurchaseKeyboard()
+    { ...buildPurchaseKeyboard(), disable_web_page_preview: true }
   );
 });
 
