@@ -538,7 +538,23 @@ bot.command('users', async (ctx) => {
     return `${i + 1}. @${u.username || u.telegram_id} — ${days}дн, ${u.max_connections} устр., сессий: ${sessions}`;
   });
 
-  await ctx.reply(`👥 Активные пользователи (${users.length}):\n\n${lines.join('\n')}`);
+  const header = `👥 Активные пользователи (${users.length}):\n\n`;
+  const MAX_LEN = 4096;
+  const chunks: string[] = [];
+  let current = header;
+
+  for (const line of lines) {
+    if (current.length + line.length + 1 > MAX_LEN) {
+      chunks.push(current);
+      current = '';
+    }
+    current += (current && current !== header ? '\n' : '') + line;
+  }
+  if (current) chunks.push(current);
+
+  for (const chunk of chunks) {
+    await ctx.reply(chunk);
+  }
 });
 
 bot.command('health', async (ctx) => {
