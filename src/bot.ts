@@ -29,6 +29,7 @@ const proxy = new ProxyManager();
 // Флаг: заблокирована ли продажа (перегрузка)
 let salesBlocked = false;
 let salesBlockReason: 'manual' | 'ram' | null = null;
+let lastRamWarnNotified = 0;
 
 function formatSalesState() {
   if (!salesBlocked) return '✅ открыты';
@@ -78,9 +79,6 @@ function buildPurchaseKeyboard() {
 
 bot.start(async (ctx) => {
   const userId = ctx.from.id;
-
-  // Обработка deeplink: /start ref_XXXXX (реферал на будущее)
-  const startPayload = ctx.startPayload;
 
   if (userId === ADMIN_ID) {
     return ctx.reply(
@@ -158,10 +156,6 @@ async function startTrial(ctx: Context) {
     return ctx.reply('🎁 Ты уже использовал бесплатный триал. Доступны платные тарифы: /tariffs');
   }
 
-  if (existing) {
-    return ctx.reply('🎁 Триал доступен только новым пользователям.');
-  }
-
   if (!canActivate) {
     return ctx.reply('😔 Все места заняты! Попробуй позже или напиши админу.');
   }
@@ -169,14 +163,24 @@ async function startTrial(ctx: Context) {
   const secret = proxy.generateSecret();
   const expiresAt = new Date(Date.now() + TRIAL_DAYS * 86400000).toISOString();
 
-  queries.insertUser.run({
-    telegram_id: userId,
-    username: ctx.from!.username || '',
-    secret,
-    expires_at: expiresAt,
-    max_connections: TRIAL_MAX_CONNECTIONS,
-    is_active: 1,
-  });
+  if (existing) {
+    // Существующий пользователь, который ранее платил, но не использовал триал
+    queries.updateUserSubscription.run({
+      telegram_id: userId,
+      secret,
+      expires_at: expiresAt,
+      max_connections: TRIAL_MAX_CONNECTIONS,
+    });
+  } else {
+    queries.insertUser.run({
+      telegram_id: userId,
+      username: ctx.from!.username || '',
+      secret,
+      expires_at: expiresAt,
+      max_connections: TRIAL_MAX_CONNECTIONS,
+      is_active: 1,
+    });
+  }
   queries.markTrialUsed.run(userId);
 
   let proxyRestarted = true;
@@ -532,9 +536,12 @@ bot.command('users', async (ctx) => {
   }
 
   const proxyStats = await proxy.getStats();
+  // Порядок секретов в volume-файле (и в stats прокси) совпадает с этим массивом
+  const secretOrder = users.map(u => u.secret).filter(Boolean);
   const lines = users.map((u, i) => {
     const days = Math.ceil((new Date(u.expires_at).getTime() - Date.now()) / 86400000);
-    const sessions = proxyStats ? (proxyStats.secretConnections[i + 1] ?? 0) : 'н/д';
+    const secretIndex = secretOrder.indexOf(u.secret);
+    const sessions = proxyStats && secretIndex >= 0 ? (proxyStats.secretConnections[secretIndex + 1] ?? 0) : 'н/д';
     return `${i + 1}. @${u.username || u.telegram_id} — ${days}дн, ${u.max_connections} устр., сессий: ${sessions}`;
   });
 
@@ -581,6 +588,10 @@ bot.command('block', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
   const tgId = parseTelegramIdFromCommand(ctx.message.text);
   if (tgId === null) return ctx.reply('Использование: /block <telegram_id>');
+
+  const user = queries.getUser.get(tgId) as any;
+  if (!user) return ctx.reply(`Пользователь ${tgId} не найден.`);
+  if (!user.is_active) return ctx.reply(`Пользователь ${tgId} уже деактивирован.`);
 
   try {
     queries.deactivateUser.run(tgId);
@@ -716,7 +727,11 @@ cron.schedule('*/5 * * * *', async () => {
       `🔴 RAM ${ram}% > ${RAM_STOP}%!\nПродажи автоматически заблокированы.`
     );
   } else if (ram > RAM_WARN) {
-    await notifyAdmin(`🟡 RAM ${ram}% — приближаемся к лимиту.`);
+    // Не спамим — уведомляем не чаще раза в час
+    if (Date.now() - lastRamWarnNotified > 3600000) {
+      lastRamWarnNotified = Date.now();
+      await notifyAdmin(`🟡 RAM ${ram}% — приближаемся к лимиту.`);
+    }
   } else if (ram < RAM_WARN && salesBlocked && salesBlockReason === 'ram') {
     // Автоматически разблокируем если RAM снизилась
     salesBlocked = false;

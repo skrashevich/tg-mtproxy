@@ -14,6 +14,8 @@ db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
 function hasColumn(table: string, column: string): boolean {
+  const allowed = ['users', 'payments', 'alerts', 'settings', 'schema_migrations'];
+  if (!allowed.includes(table)) throw new Error(`hasColumn: unknown table "${table}"`);
   const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
   return columns.some((c) => c.name === column);
 }

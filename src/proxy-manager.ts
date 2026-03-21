@@ -1,8 +1,12 @@
-import { execSync, exec } from 'child_process';
+import { execSync } from 'child_process';
 import crypto from 'crypto';
+import fs from 'fs';
 import { queries } from './database';
 
 const CONTAINER = process.env.PROXY_CONTAINER || 'mtproxy';
+if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(CONTAINER)) {
+  throw new Error(`Invalid PROXY_CONTAINER name: ${CONTAINER}`);
+}
 
 /**
  * ProxyManager управляет MTProto proxy контейнером.
@@ -83,8 +87,6 @@ export class ProxyManager {
       return { updated, image };
     }
 
-    // Секреты уже записаны в volume (/data/secret) предыдущими вызовами restartWithSecrets.
-    // Именованный volume переживает rm+run, поэтому SECRET env не нужен.
     const tag = process.env.PROXY_TAG || '';
     const tagArg = tag ? `-e TAG=${tag}` : '';
     const cmd = [
@@ -98,6 +100,22 @@ export class ProxyManager {
     ].filter(Boolean).join(' ');
 
     execSync(cmd, { timeout: 30000 });
+
+    // Записываем актуальные секреты в volume после запуска контейнера
+    try {
+      const volumePath = execSync(
+        `docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' ${CONTAINER}`,
+        { timeout: 5000 }
+      ).toString().trim();
+
+      if (volumePath) {
+        fs.writeFileSync(`${volumePath}/secret`, secrets.join(','));
+        execSync(`docker restart -t 1 ${CONTAINER}`, { timeout: 15000 });
+      }
+    } catch (err: any) {
+      console.error('[ProxyManager] Ошибка записи секретов при обновлении:', err.message);
+    }
+
     console.log(`[ProxyManager] Контейнер запущен: ${image} (${secrets.length} секретов)`);
 
     return { updated, image };
@@ -136,7 +154,7 @@ export class ProxyManager {
       ).toString().trim();
 
       if (volumePath) {
-        execSync(`printf '%s' '${secretsStr}' > ${volumePath}/secret`, { timeout: 3000 });
+        fs.writeFileSync(`${volumePath}/secret`, secretsStr);
       }
     } catch (err: any) {
       console.error('[ProxyManager] Ошибка записи секретов:', err.message);
