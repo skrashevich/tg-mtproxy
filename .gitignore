@@ -6,3 +6,5 @@ data/
 *.db-journal
 *.db-wal
 .idea
+.omc
+.DS_Store
