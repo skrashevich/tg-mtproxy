@@ -1,7 +1,11 @@
-import { execSync } from 'child_process';
+import { execFile, exec } from 'child_process';
+import { promisify } from 'util';
 import crypto from 'crypto';
-import fs from 'fs';
+import { writeFile } from 'fs/promises';
 import { queries } from './database';
+
+const execFileAsync = promisify(execFile);
+const execAsync = promisify(exec);
 
 const CONTAINER = process.env.PROXY_CONTAINER || 'mtproxy';
 if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(CONTAINER)) {
@@ -53,22 +57,23 @@ export class ProxyManager {
     // Определяем образ: из запущенного контейнера или из env/дефолта
     let image: string;
     try {
-      image = execSync(
-        `docker inspect -f '{{.Config.Image}}' ${CONTAINER}`,
+      const { stdout } = await execFileAsync(
+        'docker', ['inspect', '-f', '{{.Config.Image}}', CONTAINER],
         { timeout: 5000 }
-      ).toString().trim();
+      );
+      image = stdout.trim();
     } catch {
       image = process.env.PROXY_IMAGE || 'ghcr.io/skrashevich/mtproxy:latest';
     }
 
     // Запоминаем текущий digest до pull
-    const digestBefore = this.getImageId(image);
+    const digestBefore = await this.getImageId(image);
 
     // Тянем новый образ (может занять время)
     console.log(`[ProxyManager] docker pull ${image}...`);
-    execSync(`docker pull ${image}`, { timeout: 120000, stdio: 'pipe' });
+    await execFileAsync('docker', ['pull', image], { timeout: 120000 });
 
-    const digestAfter = this.getImageId(image);
+    const digestAfter = await this.getImageId(image);
     const updated = digestBefore !== digestAfter;
 
     // Берём активные секреты
@@ -77,9 +82,10 @@ export class ProxyManager {
 
     // Останавливаем и удаляем старый контейнер
     try {
-      execSync(`docker stop -t 5 ${CONTAINER} 2>/dev/null; docker rm ${CONTAINER} 2>/dev/null`, {
-        timeout: 20000,
-      });
+      await execFileAsync('docker', ['stop', '-t', '5', CONTAINER], { timeout: 15000 });
+    } catch { /* контейнер мог не существовать */ }
+    try {
+      await execFileAsync('docker', ['rm', CONTAINER], { timeout: 5000 });
     } catch { /* контейнер мог не существовать */ }
 
     if (secrets.length === 0) {
@@ -88,29 +94,29 @@ export class ProxyManager {
     }
 
     const tag = process.env.PROXY_TAG || '';
-    const tagArg = tag ? `-e TAG=${tag}` : '';
-    const cmd = [
-      'docker run -d',
+    const args = [
+      'run', '-d',
       `--name=${CONTAINER}`,
       '--restart=always',
-      `-p ${this.proxyPort}:443`,
-      `-v ${CONTAINER}-config:/data`,
-      tagArg,
+      '-p', `${this.proxyPort}:443`,
+      '-v', `${CONTAINER}-config:/data`,
+      ...(tag ? ['-e', `TAG=${tag}`] : []),
       image,
-    ].filter(Boolean).join(' ');
+    ];
 
-    execSync(cmd, { timeout: 30000 });
+    await execFileAsync('docker', args, { timeout: 30000 });
 
     // Записываем актуальные секреты в volume после запуска контейнера
     try {
-      const volumePath = execSync(
-        `docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' ${CONTAINER}`,
+      const { stdout } = await execFileAsync(
+        'docker', ['inspect', '-f', '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}', CONTAINER],
         { timeout: 5000 }
-      ).toString().trim();
+      );
+      const volumePath = stdout.trim();
 
       if (volumePath) {
-        fs.writeFileSync(`${volumePath}/secret`, secrets.join(','));
-        execSync(`docker restart -t 1 ${CONTAINER}`, { timeout: 15000 });
+        await writeFile(`${volumePath}/secret`, secrets.join(','));
+        await execFileAsync('docker', ['restart', '-t', '1', CONTAINER], { timeout: 15000 });
       }
     } catch (err: any) {
       console.error('[ProxyManager] Ошибка записи секретов при обновлении:', err.message);
@@ -121,11 +127,13 @@ export class ProxyManager {
     return { updated, image };
   }
 
-  private getImageId(image: string): string {
+  private async getImageId(image: string): Promise<string> {
     try {
-      return execSync(`docker image inspect -f '{{.Id}}' ${image} 2>/dev/null`, {
-        timeout: 5000,
-      }).toString().trim();
+      const { stdout } = await execFileAsync(
+        'docker', ['image', 'inspect', '-f', '{{.Id}}', image],
+        { timeout: 5000 }
+      );
+      return stdout.trim();
     } catch {
       return '';
     }
@@ -148,13 +156,16 @@ export class ProxyManager {
 
     // Пишем секреты в файл volume
     try {
-      const volumePath = execSync(
-        `docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' ${CONTAINER}`,
+      const { stdout } = await execFileAsync(
+        'docker', ['inspect', '-f', '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}', CONTAINER],
         { timeout: 5000 }
-      ).toString().trim();
+      );
+      const volumePath = stdout.trim();
 
       if (volumePath) {
-        fs.writeFileSync(`${volumePath}/secret`, secretsStr);
+        await writeFile(`${volumePath}/secret`, secretsStr);
+      } else {
+        console.warn('[ProxyManager] Volume path пуст — секреты не записаны');
       }
     } catch (err: any) {
       console.error('[ProxyManager] Ошибка записи секретов:', err.message);
@@ -162,7 +173,7 @@ export class ProxyManager {
 
     // Быстрый restart (1-2 сек)
     try {
-      execSync(`docker restart -t 1 ${CONTAINER}`, { timeout: 15000 });
+      await execFileAsync('docker', ['restart', '-t', '1', CONTAINER], { timeout: 15000 });
       console.log(`[ProxyManager] Рестарт с ${secrets.length} секретами`);
     } catch (err: any) {
       console.error('[ProxyManager] Ошибка рестарта:', err.message);
@@ -177,12 +188,12 @@ export class ProxyManager {
     secretConnections: Record<number, number>;
   } | null> {
     try {
-      const result = execSync(
-        `docker exec ${CONTAINER} curl -s http://localhost:2398/stats 2>/dev/null`,
+      const { stdout } = await execFileAsync(
+        'docker', ['exec', CONTAINER, 'curl', '-s', 'http://localhost:2398/stats'],
         { timeout: 5000 }
-      ).toString();
+      );
 
-      const lines = result.split('\n');
+      const lines = stdout.split('\n');
       let totalConnections = 0;
       let maxConnections = 0;
       const secretConnections: Record<number, number> = {};
@@ -215,25 +226,26 @@ export class ProxyManager {
   }
 
   /** Проверяет здоровье контейнера */
-  isContainerRunning(): boolean {
+  async isContainerRunning(): Promise<boolean> {
     try {
-      const result = execSync(`docker inspect -f '{{.State.Running}}' ${CONTAINER} 2>/dev/null`, {
-        timeout: 5000,
-      }).toString().trim();
-      return result === 'true';
+      const { stdout } = await execFileAsync(
+        'docker', ['inspect', '-f', '{{.State.Running}}', CONTAINER],
+        { timeout: 5000 }
+      );
+      return stdout.trim() === 'true';
     } catch {
       return false;
     }
   }
 
   /** Получает использование RAM в процентах */
-  getRAMUsage(): number {
+  async getRAMUsage(): Promise<number> {
     try {
-      const result = execSync(
+      const { stdout } = await execAsync(
         "free | awk '/Mem:/ {printf \"%.0f\", $3/$2 * 100}'",
         { timeout: 3000 }
-      ).toString().trim();
-      return parseInt(result) || 0;
+      );
+      return parseInt(stdout.trim()) || 0;
     } catch {
       return 0;
     }

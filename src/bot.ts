@@ -509,8 +509,8 @@ bot.command('stats', async (ctx) => {
   const total = (queries.getTotalUsersCount.get() as any).count;
   const payStats = queries.getPaymentStats.get() as any;
   const proxyStats = await proxy.getStats();
-  const ram = proxy.getRAMUsage();
-  const running = proxy.isContainerRunning();
+  const ram = await proxy.getRAMUsage();
+  const running = await proxy.isContainerRunning();
 
   await ctx.reply(
     `📊 Статистика:\n\n` +
@@ -567,8 +567,8 @@ bot.command('users', async (ctx) => {
 bot.command('health', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
 
-  const ram = proxy.getRAMUsage();
-  const running = proxy.isContainerRunning();
+  const ram = await proxy.getRAMUsage();
+  const running = await proxy.isContainerRunning();
   const stats = await proxy.getStats();
 
   let status = '✅ Всё в порядке';
@@ -715,8 +715,8 @@ cron.schedule('*/30 * * * *', async () => {
 
 // Каждые 5 минут — мониторинг RAM и здоровья
 cron.schedule('*/5 * * * *', async () => {
-  const ram = proxy.getRAMUsage();
-  const running = proxy.isContainerRunning();
+  const ram = await proxy.getRAMUsage();
+  const running = await proxy.isContainerRunning();
   const active = (queries.getActiveUsersCount.get() as any).count;
 
   // RAM алерты
