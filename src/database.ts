@@ -136,6 +136,14 @@ export const queries: Record<string, any> = {
     WHERE telegram_id = ?
   `),
 
+  extendSubscription: db.prepare(`
+    UPDATE users SET
+      expires_at = @expires_at,
+      is_active = 1,
+      updated_at = datetime('now')
+    WHERE telegram_id = @telegram_id
+  `),
+
   markTrialUsed: db.prepare(`
     UPDATE users SET trial_used = 1, updated_at = datetime('now')
     WHERE telegram_id = ?

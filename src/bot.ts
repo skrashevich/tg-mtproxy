@@ -495,6 +495,7 @@ bot.command('admin', async (ctx) => {
       '/health — здоровье сервера\n' +
       '/block <tg_id> — деактивировать юзера\n' +
       '/unblock <tg_id> — активировать юзера\n' +
+      '/extend <tg_id> <дней> — продлить подписку\n' +
       '/restart_proxy — перезапустить прокси\n' +
       '/update_proxy — обновить образ и перезапустить\n' +
       '/toggle_sales — вкл/выкл продажи\n' +
@@ -623,6 +624,52 @@ bot.command('unblock', async (ctx) => {
     queries.activateUser.run(tgId);
     await proxy.restartWithSecrets();
     await ctx.reply(`✅ Пользователь ${tgId} активирован, proxy перезапущен.`);
+  } catch (err: any) {
+    await ctx.reply(`❌ Ошибка: ${err.message}`);
+  }
+});
+
+bot.command('extend', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return;
+  const parts = ctx.message.text.split(/\s+/);
+  const tgId = Number.parseInt(parts[1], 10);
+  const days = Number.parseInt(parts[2], 10);
+  if (Number.isNaN(tgId) || Number.isNaN(days) || days <= 0) {
+    return ctx.reply('Использование: /extend <telegram_id> <дней>');
+  }
+
+  const user = queries.getUser.get(tgId) as any;
+  if (!user) return ctx.reply(`Пользователь ${tgId} не найден.`);
+
+  // Если активен — прибавляем дни к текущей дате истечения, иначе — от сейчас
+  const baseDate = user.is_active
+    ? new Date(Math.max(new Date(user.expires_at).getTime(), Date.now()))
+    : new Date();
+  const expiresAt = new Date(baseDate.getTime() + days * 86400000).toISOString();
+
+  try {
+    queries.extendSubscription.run({ telegram_id: tgId, expires_at: expiresAt });
+
+    if (!user.is_active) {
+      await proxy.restartWithSecrets();
+    }
+
+    await ctx.reply(
+      `✅ Подписка пользователя ${tgId} продлена на ${days} дн.\n` +
+        `Действует до: ${formatDate(expiresAt)}`
+    );
+
+    // Уведомляем пользователя
+    try {
+      await bot.telegram.sendMessage(
+        tgId,
+        `🎉 Твоя подписка продлена на ${days} дн. (админом)\n` +
+          `Действует до: ${formatDate(expiresAt)}\n\n` +
+          `Ссылка: /link`
+      );
+    } catch {
+      // Пользователь мог заблокировать бота
+    }
   } catch (err: any) {
     await ctx.reply(`❌ Ошибка: ${err.message}`);
   }
