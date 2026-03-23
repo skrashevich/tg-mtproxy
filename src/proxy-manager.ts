@@ -26,23 +26,68 @@ function shellEscape(s: string): string {
  * - local: Docker на той же машине (команды напрямую)
  * - remote: Docker на удалённом сервере (команды через SSH)
  */
+// ─── Дебаунс рестарта по серверам ───
+const restartTimeouts = new Map<number, ReturnType<typeof setTimeout>>();
+const restartResolvers = new Map<number, Array<() => void>>();
+
 export class ProxyManager {
+
+  /**
+   * Дебаунсированный рестарт: если несколько вызовов за 3 секунды —
+   * перезапуск произойдёт один раз, все вызовы получат resolve.
+   */
+  debouncedRestart(serverId: number): Promise<void> {
+    return new Promise((resolve) => {
+      const resolvers = restartResolvers.get(serverId) || [];
+      resolvers.push(resolve);
+      restartResolvers.set(serverId, resolvers);
+
+      const existing = restartTimeouts.get(serverId);
+      if (existing) clearTimeout(existing);
+
+      restartTimeouts.set(serverId, setTimeout(async () => {
+        restartTimeouts.delete(serverId);
+        const currentResolvers = restartResolvers.get(serverId) || [];
+        restartResolvers.set(serverId, []);
+
+        try {
+          await this.restartWithSecrets(serverId);
+        } catch (err) {
+          console.error(`[ProxyManager] Ошибка дебаунс-рестарта сервера ${serverId}:`, err);
+        }
+        currentResolvers.forEach(r => r());
+      }, 3000));
+    });
+  }
 
   /** Генерирует 16-байтный hex secret (32 символа) */
   generateSecret(): string {
     return crypto.randomBytes(16).toString('hex');
   }
 
+  /**
+   * Формирует полный секрет с префиксом для ссылок и Docker.
+   * - Без FakeTLS: dd + secret (random padding)
+   * - С FakeTLS: ee + secret + hex(domain)
+   */
+  formatSecret(secret: string, server: ServerRecord): string {
+    if (server.fake_tls_domain) {
+      const domainHex = Buffer.from(server.fake_tls_domain, 'utf-8').toString('hex');
+      return `ee${secret}${domainHex}`;
+    }
+    return `dd${secret}`;
+  }
+
   /** Формирует tg:// ссылку для подключения */
   buildLink(secret: string, server: ServerRecord): string {
-    const ddSecret = `dd${secret}`;
-    return `tg://proxy?server=${server.host}&port=${server.port}&secret=${ddSecret}`;
+    const fullSecret = this.formatSecret(secret, server);
+    return `tg://proxy?server=${server.host}&port=${server.port}&secret=${fullSecret}`;
   }
 
   /** Формирует t.me ссылку */
   buildWebLink(secret: string, server: ServerRecord): string {
-    const ddSecret = `dd${secret}`;
-    return `https://t.me/proxy?server=${server.host}&port=${server.port}&secret=${ddSecret}`;
+    const fullSecret = this.formatSecret(secret, server);
+    return `https://t.me/proxy?server=${server.host}&port=${server.port}&secret=${fullSecret}`;
   }
 
   /** Выбирает наименее загруженный активный сервер */
@@ -116,13 +161,14 @@ export class ProxyManager {
     if (!server) throw new Error(`Сервер ${serverId} не найден`);
 
     const activeUsers = queries.getActiveUsersByServer.all(serverId) as any[];
-    const secrets = activeUsers.map((u: any) => u.secret).filter(Boolean);
+    const rawSecrets = activeUsers.map((u: any) => u.secret).filter(Boolean);
 
-    if (secrets.length === 0) {
+    if (rawSecrets.length === 0) {
       console.log(`[ProxyManager] Сервер "${server.name}": нет активных секретов`);
       return;
     }
 
+    const secrets = rawSecrets.map(s => this.formatSecret(s, server));
     const secretsStr = secrets.join(',');
     const container = server.container_name;
 
@@ -195,13 +241,13 @@ export class ProxyManager {
     const updated = digestBefore !== digestAfter;
 
     const activeUsers = queries.getActiveUsersByServer.all(serverId) as any[];
-    const secrets = activeUsers.map((u: any) => u.secret).filter(Boolean);
+    const rawSecrets = activeUsers.map((u: any) => u.secret).filter(Boolean);
 
     // Останавливаем и удаляем старый контейнер
     try { await this.execDocker(server, ['stop', '-t', '5', container]); } catch { /* ok */ }
     try { await this.execDocker(server, ['rm', container], 5000); } catch { /* ok */ }
 
-    if (secrets.length === 0) {
+    if (rawSecrets.length === 0) {
       console.log(`[ProxyManager] Сервер "${server.name}": нет активных секретов — контейнер не запущен`);
       return { updated, image };
     }
@@ -228,10 +274,11 @@ export class ProxyManager {
       );
 
       if (volumePath) {
+        const secrets = rawSecrets.map(s => this.formatSecret(s, server));
+        const secretsStr = secrets.join(',');
         if (server.type === 'local') {
-          await writeFile(`${volumePath}/secret`, secrets.join(','));
+          await writeFile(`${volumePath}/secret`, secretsStr);
         } else {
-          const secretsStr = secrets.join(',');
           await this.execRemoteShell(
             server,
             `echo '${shellEscape(secretsStr)}' > '${shellEscape(volumePath)}/secret'`,
@@ -244,7 +291,7 @@ export class ProxyManager {
       console.error(`[ProxyManager] Сервер "${server.name}": ошибка записи секретов при обновлении:`, err.message);
     }
 
-    console.log(`[ProxyManager] Сервер "${server.name}": контейнер запущен: ${image} (${secrets.length} секретов)`);
+    console.log(`[ProxyManager] Сервер "${server.name}": контейнер запущен: ${image} (${rawSecrets.length} секретов)`);
     return { updated, image };
   }
 

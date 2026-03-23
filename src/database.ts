@@ -14,7 +14,7 @@ db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
 function hasColumn(table: string, column: string): boolean {
-  const allowed = ['users', 'payments', 'alerts', 'settings', 'schema_migrations'];
+  const allowed = ['users', 'payments', 'alerts', 'settings', 'schema_migrations', 'servers'];
   if (!allowed.includes(table)) throw new Error(`hasColumn: unknown table "${table}"`);
   const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
   return columns.some((c) => c.name === column);
@@ -34,6 +34,7 @@ db.exec(`
     ssh_key_path    TEXT,
     max_users       INTEGER DEFAULT 50,
     is_active       INTEGER DEFAULT 1,
+    fake_tls_domain TEXT,
     created_at      TEXT DEFAULT (datetime('now'))
   );
 
@@ -65,6 +66,19 @@ db.exec(`
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     type            TEXT NOT NULL,  -- overload | expired | error
     message         TEXT NOT NULL,
+    created_at      TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS pending_payments (
+    label           TEXT PRIMARY KEY,
+    telegram_id     INTEGER NOT NULL,
+    tariff_id       TEXT NOT NULL,
+    server_id       INTEGER,
+    chat_id         INTEGER NOT NULL,
+    username        TEXT DEFAULT '',
+    payment_method  TEXT NOT NULL DEFAULT 'stars',
+    status          TEXT DEFAULT 'pending',  -- pending | claimed | expired
+    payment_id      TEXT,
     created_at      TEXT DEFAULT (datetime('now'))
   );
 `);
@@ -114,6 +128,14 @@ const migrations: Migration[] = [
       }
     },
   },
+  {
+    id: '20260323_add_servers_fake_tls_domain',
+    up: () => {
+      if (!hasColumn('servers', 'fake_tls_domain')) {
+        db.exec(`ALTER TABLE servers ADD COLUMN fake_tls_domain TEXT`);
+      }
+    },
+  },
 ];
 
 for (const migration of migrations) {
@@ -134,8 +156,8 @@ export const queries: Record<string, any> = {
   getServer: db.prepare(`SELECT * FROM servers WHERE id = ?`),
   getServerByName: db.prepare(`SELECT * FROM servers WHERE name = ?`),
   upsertServer: db.prepare(`
-    INSERT INTO servers (name, type, host, port, container_name, ssh_host, ssh_port, ssh_key_path, max_users, is_active)
-    VALUES (@name, @type, @host, @port, @container_name, @ssh_host, @ssh_port, @ssh_key_path, @max_users, @is_active)
+    INSERT INTO servers (name, type, host, port, container_name, ssh_host, ssh_port, ssh_key_path, max_users, is_active, fake_tls_domain)
+    VALUES (@name, @type, @host, @port, @container_name, @ssh_host, @ssh_port, @ssh_key_path, @max_users, @is_active, @fake_tls_domain)
     ON CONFLICT(name) DO UPDATE SET
       type = excluded.type,
       host = excluded.host,
@@ -145,7 +167,8 @@ export const queries: Record<string, any> = {
       ssh_port = excluded.ssh_port,
       ssh_key_path = excluded.ssh_key_path,
       max_users = excluded.max_users,
-      is_active = excluded.is_active
+      is_active = excluded.is_active,
+      fake_tls_domain = excluded.fake_tls_domain
   `),
   setServerActive: db.prepare(`UPDATE servers SET is_active = @is_active WHERE id = @id`),
   getActiveUsersCountByServer: db.prepare(`SELECT COUNT(*) as count FROM users WHERE is_active = 1 AND server_id = ?`),
@@ -264,6 +287,32 @@ export const queries: Record<string, any> = {
     ON CONFLICT(key) DO UPDATE SET
       value = excluded.value,
       updated_at = datetime('now')
+  `),
+
+  // Ожидающие платежи (CryptoBot, CryptoCloud)
+  insertPendingPayment: db.prepare(`
+    INSERT INTO pending_payments (label, telegram_id, tariff_id, server_id, chat_id, username, payment_method)
+    VALUES (@label, @telegram_id, @tariff_id, @server_id, @chat_id, @username, @payment_method)
+  `),
+
+  getPendingPayment: db.prepare(`
+    SELECT * FROM pending_payments WHERE label = ? AND status = 'pending'
+  `),
+
+  getAllPendingPayments: db.prepare(`
+    SELECT * FROM pending_payments WHERE status = 'pending' ORDER BY created_at ASC
+  `),
+
+  claimPendingPayment: db.prepare(`
+    UPDATE pending_payments SET status = 'claimed' WHERE label = ? AND status = 'pending'
+  `),
+
+  expirePendingPayment: db.prepare(`
+    UPDATE pending_payments SET status = 'expired' WHERE label = ? AND status = 'pending'
+  `),
+
+  getPendingPaymentsCount: db.prepare(`
+    SELECT COUNT(*) as count FROM pending_payments WHERE status = 'pending'
   `),
 };
 

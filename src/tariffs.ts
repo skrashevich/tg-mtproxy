@@ -14,6 +14,7 @@ export interface Tariff {
   name: string;
   emoji: string;
   stars: number;
+  price: number;  // цена в рублях для внешних провайдеров
   days: number;
   maxConnections: number;
   description: string;
@@ -25,6 +26,7 @@ export const TARIFFS: Record<string, Tariff> = {
     name: '1 день',
     emoji: '⚡',
     stars: 2,
+    price: 5,
     days: 1,
     maxConnections: 1,
     description: '~5 руб • 1 устройство',
@@ -34,6 +36,7 @@ export const TARIFFS: Record<string, Tariff> = {
     name: '7 дней',
     emoji: '🔵',
     stars: 12,
+    price: 25,
     days: 7,
     maxConnections: 5,
     description: '25 руб • 5 устройств',
@@ -43,6 +46,7 @@ export const TARIFFS: Record<string, Tariff> = {
     name: '30 дней',
     emoji: '🟣',
     stars: 25,
+    price: 50,
     days: 30,
     maxConnections: 5,
     description: '~50 руб • 5 устройств',

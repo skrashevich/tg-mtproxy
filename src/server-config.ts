@@ -13,6 +13,7 @@ export interface ServerConfig {
   ssh_key_path?: string;
   max_users: number;
   is_active: boolean;
+  fake_tls_domain?: string;
 }
 
 export interface ServerRecord extends ServerConfig {
@@ -24,6 +25,7 @@ export interface ServerRecord extends ServerConfig {
 const SERVERS_JSON_PATH = path.join(__dirname, '..', 'data', 'servers.json');
 
 function buildDefaultConfig(): ServerConfig[] {
+  const fakeTlsDomain = process.env.FAKE_TLS_DOMAIN || undefined;
   return [
     {
       name: 'local',
@@ -33,6 +35,7 @@ function buildDefaultConfig(): ServerConfig[] {
       container_name: process.env.PROXY_CONTAINER || 'mtproxy',
       max_users: parseInt(process.env.MAX_USERS || '50'),
       is_active: true,
+      ...(fakeTlsDomain ? { fake_tls_domain: fakeTlsDomain } : {}),
     },
   ];
 }
@@ -55,6 +58,9 @@ function validateServerConfig(cfg: any, index: number): void {
   }
   if (cfg.ssh_port !== undefined && (typeof cfg.ssh_port !== 'number' || cfg.ssh_port < 1 || cfg.ssh_port > 65535)) {
     throw new Error(`servers.json[${index}]: "ssh_port" должен быть числом 1-65535`);
+  }
+  if (cfg.fake_tls_domain !== undefined && (typeof cfg.fake_tls_domain !== 'string' || !/^[a-zA-Z0-9.-]+$/.test(cfg.fake_tls_domain))) {
+    throw new Error(`servers.json[${index}]: "fake_tls_domain" должен быть валидным доменным именем`);
   }
 }
 
@@ -105,6 +111,7 @@ export function syncServers(): void {
       ssh_key_path: cfg.ssh_key_path ?? null,
       max_users: cfg.max_users ?? 50,
       is_active: cfg.is_active !== false ? 1 : 0,
+      fake_tls_domain: cfg.fake_tls_domain ?? null,
     });
   }
 

@@ -1,11 +1,17 @@
 import { Telegraf, Markup, Context } from 'telegraf';
 import { message } from 'telegraf/filters';
+import crypto from 'crypto';
 import { queries } from './database';
 import { ProxyManager } from './proxy-manager';
 import { TARIFFS, getTariffById, formatTariffList } from './tariffs';
 import { formatTimeLeft } from './helpers';
 import { syncServers, ServerRecord } from './server-config';
 import { fetchGithubKeys, ensureBotSshKey, getBotPublicKey, getBotKeyPath, deployKeysToServer } from './ssh-keys';
+import {
+  isMethodEnabled, setMethodEnabled, getEnabledMethods, getProvider,
+  getAllMethodsStatus, startPaymentPolling, PAYMENT_METHOD_NAMES, ALL_METHODS,
+} from './payments';
+import type { PaymentMethod } from './payments';
 import cron from 'node-cron';
 
 // ─── Конфиг ───
@@ -356,6 +362,41 @@ for (const tariffId of Object.keys(TARIFFS)) {
       return ctx.reply('😔 Все места заняты! Попробуй позже или напиши админу.');
     }
 
+    const enabledMethods = getEnabledMethods();
+    if (enabledMethods.length === 0) {
+      return ctx.reply('⚠️ Нет доступных способов оплаты. Напиши админу.');
+    }
+
+    // Один метод — используем сразу, несколько — предлагаем выбор
+    if (enabledMethods.length === 1) {
+      await processPayment(ctx, tariffId, enabledMethods[0]);
+    } else {
+      const buttons = enabledMethods.map(m =>
+        [Markup.button.callback(PAYMENT_METHOD_NAMES[m], `pay_${tariffId}_${m}`)]
+      );
+      await ctx.reply(
+        `${tariff.emoji} ${tariff.name}\n\nВыбери способ оплаты:`,
+        Markup.inlineKeyboard(buttons)
+      );
+    }
+  });
+}
+
+// Обработка выбора метода оплаты (при нескольких включённых)
+for (const tariffId of Object.keys(TARIFFS)) {
+  for (const method of ALL_METHODS) {
+    bot.action(`pay_${tariffId}_${method}`, async (ctx) => {
+      await ctx.answerCbQuery();
+      await processPayment(ctx, tariffId, method);
+    });
+  }
+}
+
+async function processPayment(ctx: Context, tariffId: string, method: PaymentMethod) {
+  const tariff = getTariffById(tariffId)!;
+  const userId = ctx.from!.id;
+
+  if (method === 'stars') {
     try {
       await ctx.replyWithInvoice({
         title: `${tariff.emoji} ${tariff.name} — Telegram Proxy`,
@@ -369,7 +410,44 @@ for (const tariffId of Object.keys(TARIFFS)) {
       console.error('Ошибка создания инвойса:', err);
       await ctx.reply('Ошибка при создании платежа. Попробуй позже.');
     }
-  });
+    return;
+  }
+
+  // Внешний провайдер (CryptoBot / CryptoCloud)
+  const provider = getProvider(method);
+  if (!provider || !provider.isConfigured()) {
+    return ctx.reply('⚠️ Способ оплаты не настроен. Напиши админу.');
+  }
+
+  try {
+    const label = `pay_${userId}_${tariffId}_${crypto.randomBytes(4).toString('hex')}`;
+    const description = `${tariff.emoji} ${tariff.name} — Telegram Proxy`;
+    const result = await provider.createPayment(tariff.price, label, description, ctx.chat!.id);
+
+    queries.insertPendingPayment.run({
+      label,
+      telegram_id: userId,
+      tariff_id: tariffId,
+      server_id: null,
+      chat_id: ctx.chat!.id,
+      username: ctx.from!.username || '',
+      payment_method: method,
+    });
+
+    const methodName = PAYMENT_METHOD_NAMES[method];
+    await ctx.reply(
+      `💳 Оплата через ${methodName}\n\n` +
+        `Тариф: ${tariff.emoji} ${tariff.name}\n` +
+        `Сумма: ${tariff.price} ₽\n\n` +
+        `👉 [Перейти к оплате](${result.payUrl})\n\n` +
+        `⏰ Ссылка действует 30 минут.\n` +
+        `После оплаты подписка активируется автоматически.`,
+      { parse_mode: 'Markdown', link_preview_options: { is_disabled: true } }
+    );
+  } catch (err: any) {
+    console.error(`Ошибка создания платежа (${method}):`, err);
+    await ctx.reply('Ошибка при создании платежа. Попробуй позже.');
+  }
 }
 
 // ─── Обработка pre_checkout_query ───
@@ -531,7 +609,8 @@ bot.command('admin', async (ctx) => {
       '/setup_server <id> — автонастройка (Docker + MTProxy)\n' +
       '/enable_server <id> — включить сервер\n' +
       '/disable_server <id> — отключить сервер\n' +
-      '/reload_servers — перечитать servers.json'
+      '/reload_servers — перечитать servers.json\n' +
+      '/payments — управление способами оплаты'
   );
 });
 
@@ -574,7 +653,8 @@ bot.command('servers', async (ctx) => {
     `${s.id}. ${s.name} [${s.type}] ${s.is_active ? '✅' : '⛔'}\n` +
     `   ${s.host}:${s.port} (${s.container_name})\n` +
     `   Юзеров: ${s.active_users}/${s.max_users}` +
-    (s.ssh_host ? `\n   SSH: ${s.ssh_host}:${s.ssh_port || 22}` : '')
+    (s.ssh_host ? `\n   SSH: ${s.ssh_host}:${s.ssh_port || 22}` : '') +
+    (s.fake_tls_domain ? `\n   FakeTLS: ${s.fake_tls_domain}` : '')
   );
 
   await ctx.reply(`🖥 Серверы (${serverLoads.length}):\n\n${lines.join('\n\n')}`);
@@ -1000,6 +1080,60 @@ bot.command('reload_servers', async (ctx) => {
   }
 });
 
+// ─── Управление способами оплаты ───
+
+bot.command('payments', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return;
+  const statuses = getAllMethodsStatus();
+  const lines = statuses.map(s => {
+    const icon = s.enabled ? '✅' : '⬜';
+    const configured = s.configured ? '' : ' ⚠️ не настроен';
+    return `${icon} ${s.name}${configured}`;
+  });
+  const buttons = statuses.map(s => [
+    Markup.button.callback(
+      `${s.enabled ? '🔴 Выкл' : '🟢 Вкл'} ${s.name}`,
+      `toggle_pay_${s.method}`
+    ),
+  ]);
+  await ctx.reply(
+    `💳 Способы оплаты:\n\n${lines.join('\n')}\n\n` +
+    `Включённые методы будут предложены пользователю при покупке.`,
+    Markup.inlineKeyboard(buttons)
+  );
+});
+
+for (const method of ALL_METHODS) {
+  bot.action(`toggle_pay_${method}`, async (ctx) => {
+    if (ctx.from!.id !== ADMIN_ID) return ctx.answerCbQuery('Нет доступа');
+    const currentlyEnabled = isMethodEnabled(method);
+    setMethodEnabled(method, !currentlyEnabled);
+    await ctx.answerCbQuery(
+      `${PAYMENT_METHOD_NAMES[method]}: ${!currentlyEnabled ? 'включён' : 'выключен'}`
+    );
+    // Обновляем сообщение
+    const statuses = getAllMethodsStatus();
+    const lines = statuses.map(s => {
+      const icon = s.enabled ? '✅' : '⬜';
+      const configured = s.configured ? '' : ' ⚠️ не настроен';
+      return `${icon} ${s.name}${configured}`;
+    });
+    const buttons = statuses.map(s => [
+      Markup.button.callback(
+        `${s.enabled ? '🔴 Выкл' : '🟢 Вкл'} ${s.name}`,
+        `toggle_pay_${s.method}`
+      ),
+    ]);
+    try {
+      await ctx.editMessageText(
+        `💳 Способы оплаты:\n\n${lines.join('\n')}\n\n` +
+        `Включённые методы будут предложены пользователю при покупке.`,
+        Markup.inlineKeyboard(buttons)
+      );
+    } catch { /* ignore if message not modified */ }
+  });
+}
+
 bot.command('toggle_sales', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
   if (salesBlocked) {
@@ -1196,7 +1330,8 @@ bot.help((ctx) => {
       '/setup_server — автонастройка сервера\n' +
       '/enable_server /disable_server — вкл/выкл сервер\n' +
       '/reload_servers — перечитать servers.json\n' +
-      '/toggle_sales /toggle_trial_notify — переключатели';
+      '/toggle_sales /toggle_trial_notify — переключатели\n' +
+      '/payments — управление оплатой';
   }
 
   ctx.reply(text);
@@ -1214,9 +1349,63 @@ export function startBot() {
 
   bot.launch();
 
+  // Запуск поллинга внешних платежей (CryptoBot, CryptoCloud)
+  startPaymentPolling(bot, async (pending) => {
+    // Обработка оплаченного платежа
+    const tariff = getTariffById(pending.tariff_id);
+    if (!tariff) return;
+
+    const chatId = pending.chat_id;
+    const userId = pending.telegram_id;
+
+    // Создаём фиктивный контекст для activateUser
+    const result = await activateUser(
+      { from: { id: userId, username: pending.username }, reply: (text: string) => bot.telegram.sendMessage(chatId, text) } as any,
+      userId, tariff.days, tariff.maxConnections, pending.server_id || undefined,
+    );
+
+    if (!result) return;
+
+    // Записываем платёж
+    queries.insertPayment.run({
+      telegram_id: userId,
+      tariff_id: tariff.id,
+      stars_amount: tariff.price,
+      status: 'completed',
+      tg_charge_id: pending.label,
+    });
+
+    const link = proxy.buildLink(result.secret, result.server);
+    const webLink = proxy.buildWebLink(result.secret, result.server);
+
+    try {
+      await bot.telegram.sendMessage(chatId,
+        `✅ Оплата принята! Спасибо!\n\n` +
+        `Тариф: ${tariff.emoji} ${tariff.name}\n` +
+        `Действует до: ${formatDate(result.expiresAt)}\n\n` +
+        `🔗 Ссылка:\n\`${link}\`\n\n` +
+        `Или нажми: [Подключить](${webLink})\n\n` +
+        `⚠️ Ссылка только для тебя — не передавай!\n` +
+        `Команды: /link — ссылка, /status — статус`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch { /* ignore */ }
+
+    const methodName = PAYMENT_METHOD_NAMES[pending.payment_method as PaymentMethod] || pending.payment_method;
+    await notifyAdmin(
+      `💰 Оплата (${methodName})!\n` +
+      `От: @${pending.username || userId}\n` +
+      `Тариф: ${tariff.name} (${tariff.price} ₽)\n` +
+      `Сервер: ${result.server.name}\n` +
+      `Активных: ${getTotalActiveCount()}`
+    );
+  });
+
   console.log('🤖 Бот запущен!');
   console.log(`👑 Админ: ${ADMIN_ID}`);
   console.log(`📦 Глобальный лимит: ${MAX_USERS} юзеров`);
+  const enabledPay = getEnabledMethods().map(m => PAYMENT_METHOD_NAMES[m]).join(', ');
+  console.log(`💳 Оплата: ${enabledPay || 'нет включённых методов'}`);
   console.log(`🖥 Серверов: ${servers.length}`);
   for (const s of servers) {
     console.log(`   ${s.name} [${s.type}] ${s.host}:${s.port} (макс: ${s.max_users})`);

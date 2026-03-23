@@ -5,7 +5,8 @@
     "host": "123.45.67.89",
     "port": 443,
     "container_name": "mtproxy",
-    "max_users": 50
+    "max_users": 50,
+    "fake_tls_domain": "ya.ru"
   },
   {
     "name": "eu-1",
@@ -16,6 +17,7 @@
     "ssh_host": "root@98.76.54.32",
     "ssh_port": 22,
     "ssh_key_path": "/root/.ssh/id_rsa",
-    "max_users": 50
+    "max_users": 50,
+    "fake_tls_domain": "google.com"
   }
 ]
