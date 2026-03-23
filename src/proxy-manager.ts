@@ -256,6 +256,120 @@ export class ProxyManager {
     }
   }
 
+  // ─── Автонастройка удалённого сервера ───
+
+  /**
+   * Настраивает удалённый сервер: устанавливает Docker, запускает MTProxy контейнер.
+   * Для local-серверов проверяет наличие Docker.
+   * Возвращает лог выполнения построчно через callback.
+   */
+  async setupServer(serverId: number, onLog: (msg: string) => void): Promise<void> {
+    const server = this.getServer(serverId);
+    if (!server) throw new Error(`Сервер ${serverId} не найден`);
+
+    const image = process.env.PROXY_IMAGE || 'ghcr.io/skrashevich/mtproxy:latest';
+    const tag = process.env.PROXY_TAG || '';
+
+    // 1. Проверяем SSH-доступ (для remote)
+    if (server.type === 'remote') {
+      onLog('🔌 Проверяю SSH-доступ...');
+      try {
+        await this.execRemoteShell(server, 'echo ok', 10000);
+        onLog('✅ SSH-доступ работает');
+      } catch (err: any) {
+        throw new Error(`SSH-доступ не работает: ${err.message}`);
+      }
+    }
+
+    // 2. Проверяем/устанавливаем Docker
+    onLog('🐳 Проверяю Docker...');
+    let dockerInstalled = false;
+    try {
+      await this.execRemoteShell(server, 'docker --version', 5000);
+      dockerInstalled = true;
+      onLog('✅ Docker уже установлен');
+    } catch {
+      onLog('📦 Docker не найден, устанавливаю...');
+    }
+
+    if (!dockerInstalled) {
+      if (server.type === 'local') {
+        throw new Error('Docker не установлен на локальном сервере. Установите вручную.');
+      }
+
+      // Устанавливаем Docker через официальный скрипт
+      onLog('⏳ Скачиваю и устанавливаю Docker (это может занять пару минут)...');
+      try {
+        await this.execRemoteShell(
+          server,
+          'curl -fsSL https://get.docker.com | sh',
+          300000  // 5 минут таймаут
+        );
+        onLog('✅ Docker установлен');
+      } catch (err: any) {
+        throw new Error(`Ошибка установки Docker: ${err.message}`);
+      }
+
+      // Запускаем Docker daemon
+      onLog('🔧 Запускаю Docker daemon...');
+      try {
+        await this.execRemoteShell(server, 'systemctl enable docker && systemctl start docker', 15000);
+        onLog('✅ Docker daemon запущен');
+      } catch (err: any) {
+        throw new Error(`Ошибка запуска Docker: ${err.message}`);
+      }
+    }
+
+    // 3. Скачиваем образ MTProxy
+    onLog(`📥 Скачиваю образ ${image}...`);
+    try {
+      await this.execDocker(server, ['pull', image], 120000);
+      onLog('✅ Образ скачан');
+    } catch (err: any) {
+      throw new Error(`Ошибка загрузки образа: ${err.message}`);
+    }
+
+    // 4. Проверяем, не запущен ли уже контейнер
+    const running = await this.isContainerRunning(serverId);
+    if (running) {
+      onLog('✅ Контейнер уже запущен');
+      return;
+    }
+
+    // 5. Запускаем контейнер (пока без секретов — они добавятся при активации пользователя)
+    onLog('🚀 Запускаю контейнер MTProxy...');
+    const container = server.container_name;
+    validateContainerName(container);
+
+    // Удаляем старый контейнер если есть
+    try { await this.execDocker(server, ['rm', '-f', container], 5000); } catch { /* ok */ }
+
+    const args = [
+      'run', '-d',
+      `--name=${container}`,
+      '--restart=always',
+      '-p', `${server.port}:443`,
+      '-v', `${container}-config:/data`,
+      ...(tag ? ['-e', `TAG=${tag}`] : []),
+      image,
+    ];
+
+    try {
+      await this.execDocker(server, args, 30000);
+      onLog('✅ Контейнер запущен');
+    } catch (err: any) {
+      throw new Error(`Ошибка запуска контейнера: ${err.message}`);
+    }
+
+    // 6. Проверяем что всё работает
+    const isRunning = await this.isContainerRunning(serverId);
+    if (isRunning) {
+      onLog('🎉 Сервер настроен и готов к работе!');
+    } else {
+      throw new Error('Контейнер запущен, но не отвечает. Проверьте логи вручную.');
+    }
+  }
+
   // ─── Мониторинг ───
 
   /** Получает статистику подключений с конкретного сервера */

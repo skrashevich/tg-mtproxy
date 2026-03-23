@@ -524,6 +524,7 @@ bot.command('admin', async (ctx) => {
       '/update_proxy [server_id] — обновить образ\n' +
       '/toggle_sales — вкл/выкл продажи\n' +
       '/toggle_trial_notify — вкл/выкл уведомления о триале\n' +
+      '/setup_server <id> — автонастройка сервера (Docker + MTProxy)\n' +
       '/enable_server <id> — включить сервер\n' +
       '/disable_server <id> — отключить сервер\n' +
       '/reload_servers — перечитать servers.json'
@@ -829,6 +830,45 @@ bot.command('enable_server', async (ctx) => {
 
   queries.setServerActive.run({ id, is_active: 1 });
   await ctx.reply(`✅ Сервер "${server.name}" включён.`);
+});
+
+bot.command('setup_server', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return;
+  const id = parseTelegramIdFromCommand(ctx.message.text);
+  if (id === null) return ctx.reply('Использование: /setup_server <id>\n\nУстановит Docker и запустит MTProxy контейнер на сервере.');
+
+  const server = queries.getServer.get(id) as any;
+  if (!server) return ctx.reply(`Сервер ${id} не найден.`);
+
+  const statusMsg = await ctx.reply(`⏳ Настраиваю сервер "${server.name}"...`);
+  const logs: string[] = [];
+
+  try {
+    await proxy.setupServer(id, (msg) => {
+      logs.push(msg);
+      // Обновляем сообщение с прогрессом
+      bot.telegram.editMessageText(
+        ctx.chat!.id,
+        statusMsg.message_id,
+        undefined,
+        `⏳ Настройка сервера "${server.name}":\n\n${logs.join('\n')}`
+      ).catch(() => {});
+    });
+
+    await bot.telegram.editMessageText(
+      ctx.chat!.id,
+      statusMsg.message_id,
+      undefined,
+      `✅ Сервер "${server.name}" настроен:\n\n${logs.join('\n')}`
+    );
+  } catch (err: any) {
+    await bot.telegram.editMessageText(
+      ctx.chat!.id,
+      statusMsg.message_id,
+      undefined,
+      `❌ Ошибка настройки сервера "${server.name}":\n\n${logs.join('\n')}\n\n❌ ${err.message}`
+    );
+  }
 });
 
 bot.command('disable_server', async (ctx) => {
