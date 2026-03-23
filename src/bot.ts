@@ -5,6 +5,7 @@ import { ProxyManager } from './proxy-manager';
 import { TARIFFS, getTariffById, formatTariffList } from './tariffs';
 import { formatTimeLeft } from './helpers';
 import { syncServers, ServerRecord } from './server-config';
+import { fetchGithubKeys, ensureBotSshKey, getBotPublicKey, getBotKeyPath, deployKeysToServer } from './ssh-keys';
 import cron from 'node-cron';
 
 // ─── Конфиг ───
@@ -524,7 +525,10 @@ bot.command('admin', async (ctx) => {
       '/update_proxy [server_id] — обновить образ\n' +
       '/toggle_sales — вкл/выкл продажи\n' +
       '/toggle_trial_notify — вкл/выкл уведомления о триале\n' +
-      '/setup_server <id> — автонастройка сервера (Docker + MTProxy)\n' +
+      '/ssh_key — показать SSH-ключ бота\n' +
+      '/github_keys <user> — SSH-ключи с GitHub\n' +
+      '/deploy_key <id> [github_user] — установить ключи на сервер\n' +
+      '/setup_server <id> — автонастройка (Docker + MTProxy)\n' +
       '/enable_server <id> — включить сервер\n' +
       '/disable_server <id> — отключить сервер\n' +
       '/reload_servers — перечитать servers.json'
@@ -832,13 +836,116 @@ bot.command('enable_server', async (ctx) => {
   await ctx.reply(`✅ Сервер "${server.name}" включён.`);
 });
 
+bot.command('ssh_key', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return;
+
+  try {
+    const pubKey = await ensureBotSshKey();
+    await ctx.reply(
+      `🔑 Публичный SSH-ключ бота:\n\n\`${pubKey}\`\n\n` +
+        `Добавь этот ключ на удалённый сервер в ~/.ssh/authorized_keys\n` +
+        `Или используй /deploy_key <server_id> [github_user] для автоматической установки`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (err: any) {
+    await ctx.reply(`❌ Ошибка: ${err.message}`);
+  }
+});
+
+bot.command('github_keys', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return;
+  const username = (ctx.message.text || '').split(/\s+/)[1];
+  if (!username) return ctx.reply('Использование: /github_keys <github_username>');
+
+  try {
+    const keys = await fetchGithubKeys(username);
+    const keyList = keys.map((k, i) => `${i + 1}. \`${k.substring(0, 60)}...\``).join('\n');
+    await ctx.reply(
+      `🔑 SSH-ключи GitHub @${username} (${keys.length}):\n\n${keyList}`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (err: any) {
+    await ctx.reply(`❌ ${err.message}`);
+  }
+});
+
+bot.command('deploy_key', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return;
+  const parts = (ctx.message.text || '').split(/\s+/);
+  const serverId = parseInt(parts[1]);
+  const githubUser = parts[2];
+
+  if (isNaN(serverId)) {
+    return ctx.reply(
+      'Использование: /deploy_key <server_id> [github_user]\n\n' +
+        'Устанавливает SSH-ключ бота на сервер.\n' +
+        'Если указан github_user — также добавляет его ключи.'
+    );
+  }
+
+  const server = queries.getServer.get(serverId) as any;
+  if (!server) return ctx.reply(`Сервер ${serverId} не найден.`);
+  if (server.type !== 'remote') return ctx.reply('Эта команда только для remote-серверов.');
+  if (!server.ssh_host) return ctx.reply('У сервера не указан ssh_host.');
+
+  try {
+    // Собираем ключи для установки
+    const keys: string[] = [];
+
+    // 1. Ключ бота
+    const botKey = await ensureBotSshKey();
+    keys.push(botKey);
+    await ctx.reply(`🔑 Ключ бота: \`${botKey.substring(0, 50)}...\``, { parse_mode: 'Markdown' });
+
+    // 2. Ключи с GitHub (если указан)
+    if (githubUser) {
+      const ghKeys = await fetchGithubKeys(githubUser);
+      keys.push(...ghKeys);
+      await ctx.reply(`🔑 Ключей с GitHub @${githubUser}: ${ghKeys.length}`);
+    }
+
+    // 3. Устанавливаем на сервер
+    await ctx.reply(`⏳ Устанавливаю ${keys.length} ключей на ${server.ssh_host}...`);
+    await deployKeysToServer(
+      keys,
+      server.ssh_host,
+      server.ssh_port || 22,
+      server.ssh_key_path || undefined,
+    );
+
+    await ctx.reply(`✅ Ключи установлены на сервер "${server.name}".`);
+  } catch (err: any) {
+    await ctx.reply(`❌ Ошибка: ${err.message}`);
+  }
+});
+
 bot.command('setup_server', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
-  const id = parseTelegramIdFromCommand(ctx.message.text);
-  if (id === null) return ctx.reply('Использование: /setup_server <id>\n\nУстановит Docker и запустит MTProxy контейнер на сервере.');
+  const parts = (ctx.message.text || '').split(/\s+/);
+  const id = parseInt(parts[1]);
+  if (isNaN(id)) {
+    return ctx.reply(
+      'Использование: /setup_server <id>\n\n' +
+        'Установит Docker и запустит MTProxy на сервере.\n' +
+        'SSH-доступ должен быть настроен заранее (/ssh_key, /deploy_key).'
+    );
+  }
 
   const server = queries.getServer.get(id) as any;
   if (!server) return ctx.reply(`Сервер ${id} не найден.`);
+
+  // Для remote-серверов проверяем, что ssh_key_path указывает на ключ бота если не задан
+  if (server.type === 'remote' && !server.ssh_key_path) {
+    const botKey = await getBotPublicKey();
+    if (botKey) {
+      // Обновляем конфигурацию сервера — используем ключ бота
+      queries.upsertServer.run({
+        ...server,
+        ssh_key_path: getBotKeyPath(),
+        is_active: server.is_active,
+      });
+    }
+  }
 
   const statusMsg = await ctx.reply(`⏳ Настраиваю сервер "${server.name}"...`);
   const logs: string[] = [];
@@ -846,12 +953,11 @@ bot.command('setup_server', async (ctx) => {
   try {
     await proxy.setupServer(id, (msg) => {
       logs.push(msg);
-      // Обновляем сообщение с прогрессом
       bot.telegram.editMessageText(
         ctx.chat!.id,
         statusMsg.message_id,
         undefined,
-        `⏳ Настройка сервера "${server.name}":\n\n${logs.join('\n')}`
+        `⏳ Настройка "${server.name}":\n\n${logs.join('\n')}`
       ).catch(() => {});
     });
 
@@ -866,7 +972,7 @@ bot.command('setup_server', async (ctx) => {
       ctx.chat!.id,
       statusMsg.message_id,
       undefined,
-      `❌ Ошибка настройки сервера "${server.name}":\n\n${logs.join('\n')}\n\n❌ ${err.message}`
+      `❌ Ошибка настройки "${server.name}":\n\n${logs.join('\n')}\n\n❌ ${err.message}`
     );
   }
 });
@@ -1064,14 +1170,36 @@ bot.telegram.setMyCommands([
 
 // ─── Помощь ───
 bot.help((ctx) => {
-  ctx.reply(
+  const isAdmin = ctx.from?.id === ADMIN_ID;
+  let text =
     '📖 Команды:\n\n' +
-      '/tariffs — тарифы и покупка\n' +
-      (TRIAL_ENABLED ? '/trial — активировать бесплатный период\n' : '') +
-      '/link — получить ссылку\n' +
-      '/status — статус подписки\n' +
-      '/help — эта справка'
-  );
+    '/tariffs — тарифы и покупка\n' +
+    (TRIAL_ENABLED ? '/trial — активировать бесплатный период\n' : '') +
+    '/link — получить ссылку\n' +
+    '/status — статус подписки\n' +
+    '/help — эта справка';
+
+  if (isAdmin) {
+    text += '\n\n👑 Админ:\n' +
+      '/admin — панель управления\n' +
+      '/stats — статистика\n' +
+      '/users — активные юзеры\n' +
+      '/servers — список серверов\n' +
+      '/server_status — статус серверов\n' +
+      '/health — здоровье серверов\n' +
+      '/block /unblock /extend — управление юзерами\n' +
+      '/restart_proxy — перезапуск всех прокси\n' +
+      '/update_proxy — обновить образ\n' +
+      '/ssh_key — SSH-ключ бота\n' +
+      '/github_keys — ключи с GitHub\n' +
+      '/deploy_key — установить ключи на сервер\n' +
+      '/setup_server — автонастройка сервера\n' +
+      '/enable_server /disable_server — вкл/выкл сервер\n' +
+      '/reload_servers — перечитать servers.json\n' +
+      '/toggle_sales /toggle_trial_notify — переключатели';
+  }
+
+  ctx.reply(text);
 });
 
 // ═══════════════════════════════════════════════
