@@ -22,6 +22,21 @@ function hasColumn(table: string, column: string): boolean {
 
 // ─── Инициализация таблиц ───
 db.exec(`
+  CREATE TABLE IF NOT EXISTS servers (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL UNIQUE,
+    type            TEXT NOT NULL CHECK(type IN ('local', 'remote')),
+    host            TEXT NOT NULL,
+    port            INTEGER DEFAULT 443,
+    container_name  TEXT DEFAULT 'mtproxy',
+    ssh_host        TEXT,
+    ssh_port        INTEGER DEFAULT 22,
+    ssh_key_path    TEXT,
+    max_users       INTEGER DEFAULT 50,
+    is_active       INTEGER DEFAULT 1,
+    created_at      TEXT DEFAULT (datetime('now'))
+  );
+
   CREATE TABLE IF NOT EXISTS users (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     telegram_id     INTEGER UNIQUE NOT NULL,
@@ -30,6 +45,7 @@ db.exec(`
     expires_at      TEXT,  -- ISO datetime
     max_connections  INTEGER DEFAULT 1,
     is_active       INTEGER DEFAULT 0,
+    server_id       INTEGER REFERENCES servers(id),
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now'))
   );
@@ -90,6 +106,14 @@ const migrations: Migration[] = [
       `);
     },
   },
+  {
+    id: '20260323_add_users_server_id',
+    up: () => {
+      if (!hasColumn('users', 'server_id')) {
+        db.exec(`ALTER TABLE users ADD COLUMN server_id INTEGER REFERENCES servers(id)`);
+      }
+    },
+  },
 ];
 
 for (const migration of migrations) {
@@ -104,6 +128,50 @@ for (const migration of migrations) {
 // ─── Подготовленные запросы ───
 
 export const queries: Record<string, any> = {
+  // Серверы
+  getAllServers: db.prepare(`SELECT * FROM servers ORDER BY id ASC`),
+  getActiveServers: db.prepare(`SELECT * FROM servers WHERE is_active = 1 ORDER BY id ASC`),
+  getServer: db.prepare(`SELECT * FROM servers WHERE id = ?`),
+  getServerByName: db.prepare(`SELECT * FROM servers WHERE name = ?`),
+  upsertServer: db.prepare(`
+    INSERT INTO servers (name, type, host, port, container_name, ssh_host, ssh_port, ssh_key_path, max_users, is_active)
+    VALUES (@name, @type, @host, @port, @container_name, @ssh_host, @ssh_port, @ssh_key_path, @max_users, @is_active)
+    ON CONFLICT(name) DO UPDATE SET
+      type = excluded.type,
+      host = excluded.host,
+      port = excluded.port,
+      container_name = excluded.container_name,
+      ssh_host = excluded.ssh_host,
+      ssh_port = excluded.ssh_port,
+      ssh_key_path = excluded.ssh_key_path,
+      max_users = excluded.max_users,
+      is_active = excluded.is_active
+  `),
+  setServerActive: db.prepare(`UPDATE servers SET is_active = @is_active WHERE id = @id`),
+  getActiveUsersCountByServer: db.prepare(`SELECT COUNT(*) as count FROM users WHERE is_active = 1 AND server_id = ?`),
+  getActiveUsersByServer: db.prepare(`SELECT * FROM users WHERE is_active = 1 AND server_id = ? ORDER BY id ASC`),
+  getExpiredUsersByServer: db.prepare(`
+    SELECT * FROM users
+    WHERE is_active = 1 AND server_id = ? AND expires_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+  `),
+  getServerLoad: db.prepare(`
+    SELECT s.*, COUNT(u.id) as active_users
+    FROM servers s
+    LEFT JOIN users u ON u.server_id = s.id AND u.is_active = 1
+    WHERE s.is_active = 1
+    GROUP BY s.id
+    HAVING active_users < s.max_users
+    ORDER BY active_users ASC
+    LIMIT 1
+  `),
+  getAllServerLoads: db.prepare(`
+    SELECT s.*, COUNT(u.id) as active_users
+    FROM servers s
+    LEFT JOIN users u ON u.server_id = s.id AND u.is_active = 1
+    GROUP BY s.id
+    ORDER BY s.id ASC
+  `),
+
   // Пользователи
   getUser: db.prepare(`SELECT * FROM users WHERE telegram_id = ?`),
   getUserBySecret: db.prepare(`SELECT * FROM users WHERE secret = ?`),
@@ -112,8 +180,8 @@ export const queries: Record<string, any> = {
   getTotalUsersCount: db.prepare(`SELECT COUNT(*) as count FROM users`),
 
   insertUser: db.prepare(`
-    INSERT INTO users (telegram_id, username, secret, expires_at, max_connections, is_active)
-    VALUES (@telegram_id, @username, @secret, @expires_at, @max_connections, @is_active)
+    INSERT INTO users (telegram_id, username, secret, expires_at, max_connections, is_active, server_id)
+    VALUES (@telegram_id, @username, @secret, @expires_at, @max_connections, @is_active, @server_id)
   `),
 
   updateUserSubscription: db.prepare(`
@@ -122,6 +190,7 @@ export const queries: Record<string, any> = {
       expires_at = @expires_at,
       max_connections = @max_connections,
       is_active = 1,
+      server_id = @server_id,
       updated_at = datetime('now')
     WHERE telegram_id = @telegram_id
   `),
@@ -142,6 +211,16 @@ export const queries: Record<string, any> = {
       is_active = 1,
       updated_at = datetime('now')
     WHERE telegram_id = @telegram_id
+  `),
+
+  updateUserServerId: db.prepare(`
+    UPDATE users SET server_id = @server_id, updated_at = datetime('now')
+    WHERE telegram_id = @telegram_id
+  `),
+
+  assignOrphansToServer: db.prepare(`
+    UPDATE users SET server_id = ?, updated_at = datetime('now')
+    WHERE server_id IS NULL
   `),
 
   markTrialUsed: db.prepare(`

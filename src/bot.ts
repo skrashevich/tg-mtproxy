@@ -4,6 +4,7 @@ import { queries } from './database';
 import { ProxyManager } from './proxy-manager';
 import { TARIFFS, getTariffById, formatTariffList } from './tariffs';
 import { formatTimeLeft } from './helpers';
+import { syncServers, ServerRecord } from './server-config';
 import cron from 'node-cron';
 
 // ─── Конфиг ───
@@ -29,7 +30,7 @@ const proxy = new ProxyManager();
 // Флаг: заблокирована ли продажа (перегрузка)
 let salesBlocked = false;
 let salesBlockReason: 'manual' | 'ram' | null = null;
-let lastRamWarnNotified = 0;
+const lastRamWarnNotified = new Map<number, number>();
 
 function formatSalesState() {
   if (!salesBlocked) return '✅ открыты';
@@ -45,10 +46,16 @@ function loadTrialNotifySetting(): boolean {
 
 let trialNotifyEnabled = loadTrialNotifySetting();
 
+function getTotalActiveCount(): number {
+  return (queries.getActiveUsersCount.get() as any).count;
+}
+
 function getCapacityState(userId: number): { existingUser: any; activeCount: number; canActivate: boolean } {
   const existingUser = queries.getUser.get(userId) as any;
-  const activeCount = (queries.getActiveUsersCount.get() as any).count;
-  const canActivate = Boolean(existingUser?.is_active) || activeCount < MAX_USERS;
+  const activeCount = getTotalActiveCount();
+  // Если пользователь уже активен — место занято, canActivate=true
+  // Иначе проверяем наличие свободного сервера (единая точка правды)
+  const canActivate = Boolean(existingUser?.is_active) || proxy.selectBestServer() !== null;
   return { existingUser, activeCount, canActivate };
 }
 
@@ -73,6 +80,11 @@ function buildPurchaseKeyboard() {
   return Markup.inlineKeyboard(rows);
 }
 
+function getUserServer(user: any): ServerRecord | null {
+  if (!user?.server_id) return null;
+  return queries.getServer.get(user.server_id) as ServerRecord | null;
+}
+
 // ═══════════════════════════════════════════════
 // КОМАНДЫ ДЛЯ ПОЛЬЗОВАТЕЛЕЙ
 // ═══════════════════════════════════════════════
@@ -92,8 +104,12 @@ bot.start(async (ctx) => {
 
   const user = queries.getUser.get(userId) as any;
   if (user?.is_active) {
-    const link = proxy.buildLink(user.secret);
-    const webLink = proxy.buildWebLink(user.secret);
+    const server = getUserServer(user);
+    if (!server) {
+      return ctx.reply('⚠️ Ошибка конфигурации сервера. Напиши админу.');
+    }
+    const link = proxy.buildLink(user.secret, server);
+    const webLink = proxy.buildWebLink(user.secret, server);
     return ctx.reply(
       `✅ У тебя есть активная подписка!\n\n` +
         `Осталось: ${formatTimeLeft(user.expires_at)}\n\n` +
@@ -132,6 +148,81 @@ async function showTariffs(ctx: Context) {
   );
 }
 
+async function activateUser(
+  ctx: Context,
+  userId: number,
+  days: number,
+  maxConnections: number,
+  serverId?: number,
+): Promise<{ secret: string; expiresAt: string; server: ServerRecord } | null> {
+  const existing = queries.getUser.get(userId) as any;
+
+  // Выбираем сервер
+  let server: ServerRecord | null = null;
+  if (existing?.is_active && existing.server_id) {
+    server = queries.getServer.get(existing.server_id) as ServerRecord | null;
+  }
+  if (serverId) {
+    server = queries.getServer.get(serverId) as ServerRecord | null;
+  }
+  if (!server) {
+    server = proxy.selectBestServer();
+  }
+  if (!server) {
+    await ctx.reply('😔 Все серверы заполнены! Попробуй позже или напиши админу.');
+    return null;
+  }
+
+  let secret: string;
+  let expiresAt: string;
+
+  if (existing) {
+    secret = existing.is_active ? existing.secret : proxy.generateSecret();
+
+    const baseDate = existing.is_active
+      ? new Date(Math.max(new Date(existing.expires_at).getTime(), Date.now()))
+      : new Date();
+    expiresAt = new Date(baseDate.getTime() + days * 86400000).toISOString();
+
+    queries.updateUserSubscription.run({
+      telegram_id: userId,
+      secret,
+      expires_at: expiresAt,
+      max_connections: Math.max(existing.max_connections || 0, maxConnections),
+      server_id: server.id,
+    });
+  } else {
+    secret = proxy.generateSecret();
+    expiresAt = new Date(Date.now() + days * 86400000).toISOString();
+
+    queries.insertUser.run({
+      telegram_id: userId,
+      username: ctx.from!.username || '',
+      secret,
+      expires_at: expiresAt,
+      max_connections: maxConnections,
+      is_active: 1,
+      server_id: server.id,
+    });
+  }
+
+  try {
+    await proxy.restartWithSecrets(server.id);
+  } catch (err) {
+    console.error(`Ошибка перезапуска сервера "${server.name}":`, err);
+    await notifyAdmin(
+      `⚠️ Ошибка перезапуска сервера "${server.name}" после активации @${ctx.from!.username || userId}.`
+    );
+    await ctx.reply(
+      '⚠️ Подписка активирована, но сервер не смог сразу применить изменения.\n' +
+        'Админ уже уведомлён и завершит активацию вручную.'
+    );
+    return null;
+  }
+
+  return { secret, expiresAt, server };
+}
+
 async function startTrial(ctx: Context) {
   if (!TRIAL_ENABLED) {
     return ctx.reply('🎁 Бесплатный триал сейчас отключён.');
@@ -146,7 +237,7 @@ async function startTrial(ctx: Context) {
     );
   }
 
-  const { existingUser: existing, activeCount, canActivate } = getCapacityState(userId);
+  const { existingUser: existing, canActivate } = getCapacityState(userId);
 
   if (existing?.is_active) {
     return ctx.reply('У тебя уже активная подписка. Используй /status или /link.');
@@ -160,55 +251,18 @@ async function startTrial(ctx: Context) {
     return ctx.reply('😔 Все места заняты! Попробуй позже или напиши админу.');
   }
 
-  const secret = proxy.generateSecret();
-  const expiresAt = new Date(Date.now() + TRIAL_DAYS * 86400000).toISOString();
+  const result = await activateUser(ctx, userId, TRIAL_DAYS, TRIAL_MAX_CONNECTIONS);
+  if (!result) return;
 
-  if (existing) {
-    // Существующий пользователь, который ранее платил, но не использовал триал
-    queries.updateUserSubscription.run({
-      telegram_id: userId,
-      secret,
-      expires_at: expiresAt,
-      max_connections: TRIAL_MAX_CONNECTIONS,
-    });
-  } else {
-    queries.insertUser.run({
-      telegram_id: userId,
-      username: ctx.from!.username || '',
-      secret,
-      expires_at: expiresAt,
-      max_connections: TRIAL_MAX_CONNECTIONS,
-      is_active: 1,
-    });
-  }
   queries.markTrialUsed.run(userId);
 
-  let proxyRestarted = true;
-  try {
-    await proxy.restartWithSecrets();
-  } catch (err) {
-    proxyRestarted = false;
-    console.error('Ошибка перезапуска proxy после триала:', err);
-    await notifyAdmin(
-      `⚠️ Ошибка перезапуска proxy после триала от @${ctx.from!.username || userId}.`
-    );
-  }
-
-  if (!proxyRestarted) {
-    await ctx.reply(
-      '⚠️ Триал выдан, но сервер не смог сразу активировать доступ.\n' +
-        'Админ уже уведомлён и завершит активацию вручную.'
-    );
-    return;
-  }
-
-  const link = proxy.buildLink(secret);
-  const webLink = proxy.buildWebLink(secret);
+  const link = proxy.buildLink(result.secret, result.server);
+  const webLink = proxy.buildWebLink(result.secret, result.server);
 
   await ctx.reply(
     `🎁 Триал активирован!\n\n` +
       `Срок: ${TRIAL_DAYS} дн.\n` +
-      `Действует до: ${formatDate(expiresAt)}\n\n` +
+      `Действует до: ${formatDate(result.expiresAt)}\n\n` +
       `🔗 Ссылка:\n\`${link}\`\n\n` +
       `Или нажми: [Подключить](${webLink})\n\n` +
       `Команды: /link — ссылка, /status — статус`,
@@ -216,11 +270,13 @@ async function startTrial(ctx: Context) {
   );
 
   if (trialNotifyEnabled) {
+    const activeCount = getTotalActiveCount();
     await notifyAdmin(
       `🎁 Выдан триал\n` +
         `Пользователь: @${ctx.from!.username || userId}\n` +
+        `Сервер: ${result.server.name}\n` +
         `Срок: ${TRIAL_DAYS} дн.\n` +
-        `Активных: ${activeCount + 1}/${MAX_USERS}`
+        `Активных: ${activeCount}/${MAX_USERS}`
     );
   }
 }
@@ -235,13 +291,19 @@ async function showStatus(ctx: Context) {
     return ctx.reply('У тебя нет активной подписки.\nИспользуй /tariffs чтобы выбрать тариф.');
   }
 
-  const link = proxy.buildLink(user.secret);
+  const server = getUserServer(user);
+  if (!server) {
+    return ctx.reply('⚠️ Ошибка конфигурации сервера. Напиши админу.');
+  }
+
+  const link = proxy.buildLink(user.secret, server);
 
   await ctx.reply(
     `📊 Твоя подписка:\n\n` +
       `Статус: ✅ Активна\n` +
       `Осталось: ${formatTimeLeft(user.expires_at)}\n` +
-      `До: ${formatDate(user.expires_at)}\n\n` +
+      `До: ${formatDate(user.expires_at)}\n` +
+      `Сервер: ${server.name}\n\n` +
       `🔗 Ссылка:\n\`${link}\``,
     { parse_mode: 'Markdown' }
   );
@@ -255,8 +317,12 @@ async function showLink(ctx: Context) {
   if (!user || !user.is_active) {
     return ctx.reply('Нет активной подписки. /tariffs');
   }
-  const link = proxy.buildLink(user.secret);
-  const webLink = proxy.buildWebLink(user.secret);
+  const server = getUserServer(user);
+  if (!server) {
+    return ctx.reply('⚠️ Ошибка конфигурации сервера. Напиши админу.');
+  }
+  const link = proxy.buildLink(user.secret, server);
+  const webLink = proxy.buildWebLink(user.secret, server);
   await ctx.reply(
     `🔗 Твоя ссылка для подключения:\n\n` +
       `\`${link}\`\n\n` +
@@ -277,7 +343,6 @@ for (const tariffId of Object.keys(TARIFFS)) {
     const tariff = getTariffById(tariffId)!;
     const userId = ctx.from!.id;
 
-    // Проверка лимитов
     if (salesBlocked) {
       return ctx.reply(
         '⏳ Сервер сейчас перегружен, продажи временно приостановлены.\n' +
@@ -286,20 +351,16 @@ for (const tariffId of Object.keys(TARIFFS)) {
     }
 
     const { canActivate } = getCapacityState(userId);
-
     if (!canActivate) {
-      return ctx.reply(
-        '😔 Все места заняты! Попробуй позже или напиши админу.'
-      );
+      return ctx.reply('😔 Все места заняты! Попробуй позже или напиши админу.');
     }
 
-    // Отправляем инвойс через Telegram Stars
     try {
       await ctx.replyWithInvoice({
         title: `${tariff.emoji} ${tariff.name} — Telegram Proxy`,
         description: tariff.description,
         payload: JSON.stringify({ tariffId, userId }),
-        provider_token: '', // пустой для Telegram Stars
+        provider_token: '',
         currency: 'XTR',
         prices: [{ label: tariff.name, amount: tariff.stars }],
       });
@@ -310,7 +371,7 @@ for (const tariffId of Object.keys(TARIFFS)) {
   });
 }
 
-// ─── Обработка pre_checkout_query (подтверждение оплаты) ───
+// ─── Обработка pre_checkout_query ───
 bot.on('pre_checkout_query', async (ctx) => {
   try {
     const payload = JSON.parse(ctx.preCheckoutQuery.invoice_payload);
@@ -320,23 +381,19 @@ bot.on('pre_checkout_query', async (ctx) => {
       return ctx.answerPreCheckoutQuery(false, 'Неизвестный тариф');
     }
 
-    // Проверяем не заблокированы ли продажи
     if (salesBlocked) {
       return ctx.answerPreCheckoutQuery(false, 'Сервер перегружен, попробуйте позже');
     }
 
-    // Инвойс должен быть оплачен тем же пользователем, для которого создан
     if (payload.userId !== ctx.from.id) {
       return ctx.answerPreCheckoutQuery(false, 'Инвойс недействителен для этого пользователя');
     }
 
-    // Повторно проверяем лимиты, т.к. инвойс мог быть создан раньше
     const { canActivate } = getCapacityState(payload.userId);
     if (!canActivate) {
       return ctx.answerPreCheckoutQuery(false, 'Все места заняты, попробуйте позже');
     }
 
-    // Всё ок — подтверждаем
     await ctx.answerPreCheckoutQuery(true);
   } catch (err) {
     console.error('pre_checkout_query error:', err);
@@ -363,7 +420,6 @@ bot.on(message('successful_payment'), async (ctx) => {
     return;
   }
 
-  // Доп. защита от оплаты чужого/устаревшего инвойса
   if (payload.userId !== userId) {
     await ctx.reply('Ошибка: инвойс не соответствует пользователю. Напиши админу.');
     await notifyAdmin(
@@ -372,7 +428,7 @@ bot.on(message('successful_payment'), async (ctx) => {
     return;
   }
 
-  const { existingUser: existing, activeCount, canActivate } = getCapacityState(userId);
+  const { activeCount, canActivate } = getCapacityState(userId);
   if (!canActivate) {
     queries.insertPayment.run({
       telegram_id: userId,
@@ -396,41 +452,27 @@ bot.on(message('successful_payment'), async (ctx) => {
     return;
   }
 
-  let secret: string;
-  let expiresAt: string;
-
-  if (existing) {
-    // Продление — генерируем новый секрет (или оставляем старый)
-    secret = existing.is_active ? existing.secret : proxy.generateSecret();
-
-    // Если активен — прибавляем дни к текущей дате истечения
-    const baseDate = existing.is_active
-      ? new Date(Math.max(new Date(existing.expires_at).getTime(), Date.now()))
-      : new Date();
-    expiresAt = new Date(baseDate.getTime() + tariff.days * 86400000).toISOString();
-
-    queries.updateUserSubscription.run({
+  const result = await activateUser(ctx, userId, tariff.days, tariff.maxConnections);
+  if (!result) {
+    // Активация не удалась — записываем платёж как pending для ручной обработки
+    queries.insertPayment.run({
       telegram_id: userId,
-      secret,
-      expires_at: expiresAt,
-      max_connections: Math.max(existing.max_connections, tariff.maxConnections),
+      tariff_id: tariff.id,
+      stars_amount: payment.total_amount,
+      status: 'pending',
+      tg_charge_id: payment.telegram_payment_charge_id,
     });
-  } else {
-    // Новый пользователь
-    secret = proxy.generateSecret();
-    expiresAt = new Date(Date.now() + tariff.days * 86400000).toISOString();
-
-    queries.insertUser.run({
-      telegram_id: userId,
-      username: ctx.from.username || '',
-      secret,
-      expires_at: expiresAt,
-      max_connections: tariff.maxConnections,
-      is_active: 1,
-    });
+    await notifyAdmin(
+      `🚨 Оплата без активации!\n` +
+        `От: @${ctx.from.username || userId}\n` +
+        `Тариф: ${tariff.name} (${payment.total_amount} ⭐)\n` +
+        `Charge ID: ${payment.telegram_payment_charge_id}\n` +
+        `Причина: не удалось активировать (нет свободных серверов или ошибка)`
+    );
+    return;
   }
 
-  // Записываем платёж
+  // Записываем платёж как завершённый
   queries.insertPayment.run({
     telegram_id: userId,
     tariff_id: tariff.id,
@@ -439,34 +481,13 @@ bot.on(message('successful_payment'), async (ctx) => {
     tg_charge_id: payment.telegram_payment_charge_id,
   });
 
-  // Пересоздаём контейнер
-  let proxyRestarted = true;
-  try {
-    await proxy.restartWithSecrets();
-  } catch (err) {
-    proxyRestarted = false;
-    console.error('Ошибка перезапуска proxy:', err);
-    await notifyAdmin(
-      `⚠️ Ошибка перезапуска proxy после оплаты от @${ctx.from.username || userId}.\n` +
-        `Charge ID: ${payment.telegram_payment_charge_id}`
-    );
-  }
-
-  if (!proxyRestarted) {
-    await ctx.reply(
-      '⚠️ Оплата принята, но сервер не смог сразу активировать доступ.\n' +
-        'Админ уже уведомлён и завершит активацию вручную.'
-    );
-    return;
-  }
-
-  const link = proxy.buildLink(secret);
-  const webLink = proxy.buildWebLink(secret);
+  const link = proxy.buildLink(result.secret, result.server);
+  const webLink = proxy.buildWebLink(result.secret, result.server);
 
   await ctx.reply(
     `✅ Оплата принята! Спасибо!\n\n` +
       `Тариф: ${tariff.emoji} ${tariff.name}\n` +
-      `Действует до: ${formatDate(expiresAt)}\n\n` +
+      `Действует до: ${formatDate(result.expiresAt)}\n\n` +
       `🔗 Ссылка:\n\`${link}\`\n\n` +
       `Или нажми: [Подключить](${webLink})\n\n` +
       `⚠️ Ссылка только для тебя — не передавай!\n` +
@@ -478,7 +499,8 @@ bot.on(message('successful_payment'), async (ctx) => {
     `💰 Оплата!\n` +
       `От: @${ctx.from.username || userId}\n` +
       `Тариф: ${tariff.name} (${payment.total_amount} ⭐)\n` +
-      `Активных: ${(queries.getActiveUsersCount.get() as any).count}`
+      `Сервер: ${result.server.name}\n` +
+      `Активных: ${getTotalActiveCount()}`
   );
 });
 
@@ -492,40 +514,88 @@ bot.command('admin', async (ctx) => {
     '👑 Админ-панель:\n\n' +
       '/stats — статистика\n' +
       '/users — активные пользователи\n' +
+      '/servers — список серверов\n' +
+      '/server_status — статус серверов\n' +
       '/health — здоровье сервера\n' +
       '/block <tg_id> — деактивировать юзера\n' +
       '/unblock <tg_id> — активировать юзера\n' +
       '/extend <tg_id> <дней> — продлить подписку\n' +
-      '/restart_proxy — перезапустить прокси\n' +
-      '/update_proxy — обновить образ и перезапустить\n' +
+      '/restart_proxy — перезапустить все прокси\n' +
+      '/update_proxy [server_id] — обновить образ\n' +
       '/toggle_sales — вкл/выкл продажи\n' +
-      '/toggle_trial_notify — вкл/выкл уведомления о триале'
+      '/toggle_trial_notify — вкл/выкл уведомления о триале\n' +
+      '/enable_server <id> — включить сервер\n' +
+      '/disable_server <id> — отключить сервер\n' +
+      '/reload_servers — перечитать servers.json'
   );
 });
 
 bot.command('stats', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
 
-  const active = (queries.getActiveUsersCount.get() as any).count;
+  const active = getTotalActiveCount();
   const total = (queries.getTotalUsersCount.get() as any).count;
   const payStats = queries.getPaymentStats.get() as any;
-  const proxyStats = await proxy.getStats();
-  const ram = await proxy.getRAMUsage();
-  const running = await proxy.isContainerRunning();
+
+  const serverLoads = proxy.getAllServerLoads();
+  const serverLines = await Promise.all(serverLoads.map(async (s: any) => {
+    const running = await proxy.isContainerRunning(s.id);
+    const ram = await proxy.getRAMUsage(s.id);
+    const stats = await proxy.getStats(s.id);
+    return `   ${s.name} (${s.type}): ${s.active_users}/${s.max_users} юзеров, ` +
+      `${running ? '✅' : '❌'}, RAM ${ram}%, подкл: ${stats?.connections ?? '?'}`;
+  }));
 
   await ctx.reply(
     `📊 Статистика:\n\n` +
-      `👥 Пользователей: ${active} активных / ${total} всего\n` +
-      `📦 Лимит: ${active}/${MAX_USERS}\n\n` +
+      `👥 Пользователей: ${active} активных / ${total} всего\n\n` +
       `💰 Платежи:\n` +
       `   Сегодня: ${payStats.today_payments || 0} (${payStats.today_stars || 0} ⭐)\n` +
       `   Всего: ${payStats.total_payments || 0} (${payStats.total_stars || 0} ⭐)\n\n` +
-      `🖥 Сервер:\n` +
-      `   RAM: ${ram}%\n` +
-      `   Proxy: ${running ? '✅ работает' : '❌ остановлен'}\n` +
-      `   Подключений: ${proxyStats?.connections ?? '?'}\n` +
+      `🖥 Серверы:\n${serverLines.join('\n')}\n\n` +
       `   Продажи: ${formatSalesState()}`
   );
+});
+
+bot.command('servers', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return;
+
+  const serverLoads = proxy.getAllServerLoads();
+  if (serverLoads.length === 0) {
+    return ctx.reply('Нет настроенных серверов.');
+  }
+
+  const lines = serverLoads.map((s: any) =>
+    `${s.id}. ${s.name} [${s.type}] ${s.is_active ? '✅' : '⛔'}\n` +
+    `   ${s.host}:${s.port} (${s.container_name})\n` +
+    `   Юзеров: ${s.active_users}/${s.max_users}` +
+    (s.ssh_host ? `\n   SSH: ${s.ssh_host}:${s.ssh_port || 22}` : '')
+  );
+
+  await ctx.reply(`🖥 Серверы (${serverLoads.length}):\n\n${lines.join('\n\n')}`);
+});
+
+bot.command('server_status', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return;
+
+  const serverLoads = proxy.getAllServerLoads();
+  const lines = await Promise.all(serverLoads.map(async (s: any) => {
+    const running = await proxy.isContainerRunning(s.id);
+    const ram = await proxy.getRAMUsage(s.id);
+    const stats = await proxy.getStats(s.id);
+
+    let status = '✅';
+    if (!running) status = '❌ ОСТАНОВЛЕН';
+    else if (ram > RAM_STOP) status = '🔴 КРИТИЧЕСКАЯ';
+    else if (ram > RAM_WARN) status = '🟡 Высокая';
+
+    return `${s.name} [${s.type}] ${status}\n` +
+      `   RAM: ${ram}%, контейнер: ${running ? 'работает' : 'СТОП'}\n` +
+      `   Юзеров: ${s.active_users}/${s.max_users}\n` +
+      `   Подключений: ${stats?.connections ?? 'н/д'}`;
+  }));
+
+  await ctx.reply(`🏥 Статус серверов:\n\n${lines.join('\n\n')}`);
 });
 
 bot.command('users', async (ctx) => {
@@ -536,27 +606,44 @@ bot.command('users', async (ctx) => {
     return ctx.reply('Нет активных пользователей.');
   }
 
-  const proxyStats = await proxy.getStats();
-  // Порядок секретов в volume-файле (и в stats прокси) совпадает с этим массивом
-  const secretOrder = users.map(u => u.secret).filter(Boolean);
-  const lines = users.map((u, i) => {
-    const days = Math.ceil((new Date(u.expires_at).getTime() - Date.now()) / 86400000);
-    const secretIndex = secretOrder.indexOf(u.secret);
-    const sessions = proxyStats && secretIndex >= 0 ? (proxyStats.secretConnections[secretIndex + 1] ?? 0) : 'н/д';
-    return `${i + 1}. @${u.username || u.telegram_id} — ${days}дн, ${u.max_connections} устр., сессий: ${sessions}`;
-  });
+  // Группируем по серверам
+  const byServer = new Map<number, any[]>();
+  for (const u of users) {
+    const sid = u.server_id || 0;
+    if (!byServer.has(sid)) byServer.set(sid, []);
+    byServer.get(sid)!.push(u);
+  }
 
-  const header = `👥 Активные пользователи (${users.length}):\n\n`;
+  const lines: string[] = [];
+  for (const [serverId, serverUsers] of byServer) {
+    const server = serverId ? queries.getServer.get(serverId) as any : null;
+    const serverName = server?.name || 'неизвестный';
+    const proxyStats = serverId ? await proxy.getStats(serverId) : null;
+    const secretOrder = serverUsers.map((u: any) => u.secret).filter(Boolean);
+
+    lines.push(`\n📡 Сервер: ${serverName}`);
+    for (let i = 0; i < serverUsers.length; i++) {
+      const u = serverUsers[i];
+      const days = Math.ceil((new Date(u.expires_at).getTime() - Date.now()) / 86400000);
+      const secretIndex = secretOrder.indexOf(u.secret);
+      const sessions = proxyStats && secretIndex >= 0 ? (proxyStats.secretConnections[secretIndex + 1] ?? 0) : 'н/д';
+      lines.push(`${i + 1}. @${u.username || u.telegram_id} — ${days}дн, ${u.max_connections} устр., сессий: ${sessions}`);
+    }
+  }
+
+  const header = `👥 Активные пользователи (${users.length}):`;
+  const fullText = header + lines.join('\n');
+
   const MAX_LEN = 4096;
   const chunks: string[] = [];
-  let current = header;
+  let current = '';
 
-  for (const line of lines) {
+  for (const line of fullText.split('\n')) {
     if (current.length + line.length + 1 > MAX_LEN) {
       chunks.push(current);
       current = '';
     }
-    current += (current && current !== header ? '\n' : '') + line;
+    current += (current ? '\n' : '') + line;
   }
   if (current) chunks.push(current);
 
@@ -568,21 +655,24 @@ bot.command('users', async (ctx) => {
 bot.command('health', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
 
-  const ram = await proxy.getRAMUsage();
-  const running = await proxy.isContainerRunning();
-  const stats = await proxy.getStats();
+  const serverLoads = proxy.getAllServerLoads();
+  const lines = await Promise.all(serverLoads.map(async (s: any) => {
+    const ram = await proxy.getRAMUsage(s.id);
+    const running = await proxy.isContainerRunning(s.id);
+    const stats = await proxy.getStats(s.id);
 
-  let status = '✅ Всё в порядке';
-  if (ram > RAM_STOP) status = '🔴 КРИТИЧЕСКАЯ НАГРУЗКА';
-  else if (ram > RAM_WARN) status = '🟡 Высокая нагрузка';
-  if (!running) status = '❌ Proxy не запущен!';
+    let status = '✅ Всё в порядке';
+    if (ram > RAM_STOP) status = '🔴 КРИТИЧЕСКАЯ НАГРУЗКА';
+    else if (ram > RAM_WARN) status = '🟡 Высокая нагрузка';
+    if (!running) status = '❌ Proxy не запущен!';
 
-  await ctx.reply(
-    `🏥 Здоровье сервера: ${status}\n\n` +
-      `RAM: ${ram}%\n` +
-      `Proxy контейнер: ${running ? 'работает' : 'ОСТАНОВЛЕН'}\n` +
-      `Подключений: ${stats?.connections ?? 'н/д'} / ${stats?.maxConnections ?? 'н/д'}`
-  );
+    return `${s.name}: ${status}\n` +
+      `   RAM: ${ram}%\n` +
+      `   Контейнер: ${running ? 'работает' : 'ОСТАНОВЛЕН'}\n` +
+      `   Подключений: ${stats?.connections ?? 'н/д'} / ${stats?.maxConnections ?? 'н/д'}`;
+  }));
+
+  await ctx.reply(`🏥 Здоровье серверов:\n\n${lines.join('\n\n')}`);
 });
 
 bot.command('block', async (ctx) => {
@@ -596,7 +686,9 @@ bot.command('block', async (ctx) => {
 
   try {
     queries.deactivateUser.run(tgId);
-    await proxy.restartWithSecrets();
+    if (user.server_id) {
+      await proxy.restartWithSecrets(user.server_id);
+    }
     await ctx.reply(`✅ Пользователь ${tgId} деактивирован, proxy перезапущен.`);
   } catch (err: any) {
     await ctx.reply(`❌ Ошибка: ${err.message}`);
@@ -622,7 +714,9 @@ bot.command('unblock', async (ctx) => {
 
   try {
     queries.activateUser.run(tgId);
-    await proxy.restartWithSecrets();
+    if (user.server_id) {
+      await proxy.restartWithSecrets(user.server_id);
+    }
     await ctx.reply(`✅ Пользователь ${tgId} активирован, proxy перезапущен.`);
   } catch (err: any) {
     await ctx.reply(`❌ Ошибка: ${err.message}`);
@@ -647,7 +741,6 @@ bot.command('extend', async (ctx) => {
     }
   }
 
-  // Если активен — прибавляем дни к текущей дате истечения, иначе — от сейчас
   const baseDate = user.is_active
     ? new Date(Math.max(new Date(user.expires_at).getTime(), Date.now()))
     : new Date();
@@ -656,9 +749,19 @@ bot.command('extend', async (ctx) => {
   try {
     queries.extendSubscription.run({ telegram_id: tgId, expires_at: expiresAt });
 
-    // Активный пользователь: секрет не изменился, рестарт не нужен
     if (!user.is_active) {
-      await proxy.restartWithSecrets();
+      // Назначаем сервер если его нет
+      let serverId = user.server_id;
+      if (!serverId) {
+        const bestServer = proxy.selectBestServer();
+        if (bestServer) {
+          serverId = bestServer.id;
+          queries.updateUserServerId.run({ server_id: serverId, telegram_id: tgId });
+        }
+      }
+      if (serverId) {
+        await proxy.restartWithSecrets(serverId);
+      }
     }
 
     await ctx.reply(
@@ -666,7 +769,6 @@ bot.command('extend', async (ctx) => {
         `Действует до: ${formatDate(expiresAt)}`
     );
 
-    // Уведомляем пользователя
     try {
       await bot.telegram.sendMessage(
         tgId,
@@ -685,8 +787,8 @@ bot.command('extend', async (ctx) => {
 bot.command('restart_proxy', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
   try {
-    await proxy.restartWithSecrets();
-    await ctx.reply('✅ Proxy контейнер перезапущен.');
+    await proxy.restartAllServers();
+    await ctx.reply('✅ Все proxy серверы перезапущены.');
   } catch (err: any) {
     await ctx.reply(`❌ Ошибка: ${err.message}`);
   }
@@ -694,13 +796,61 @@ bot.command('restart_proxy', async (ctx) => {
 
 bot.command('update_proxy', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
-  await ctx.reply('⏳ Скачиваю новый образ...');
+
+  const serverIdStr = (ctx.message.text || '').split(/\s+/)[1];
+  const servers = serverIdStr
+    ? [queries.getServer.get(parseInt(serverIdStr)) as ServerRecord].filter(Boolean)
+    : queries.getActiveServers.all() as ServerRecord[];
+
+  if (servers.length === 0) {
+    return ctx.reply('Серверы не найдены.');
+  }
+
+  await ctx.reply(`⏳ Обновляю ${servers.length} серверов...`);
+
+  for (const server of servers) {
+    try {
+      const { updated, image } = await proxy.updateAndRestart(server.id);
+      const status = updated ? '✅ Образ обновлён' : '✅ Образ актуален';
+      await ctx.reply(`${server.name}: ${status}\n\`${image}\``, { parse_mode: 'Markdown' });
+    } catch (err: any) {
+      await ctx.reply(`❌ ${server.name}: ${err.message}`);
+    }
+  }
+});
+
+bot.command('enable_server', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return;
+  const id = parseTelegramIdFromCommand(ctx.message.text);
+  if (id === null) return ctx.reply('Использование: /enable_server <id>');
+
+  const server = queries.getServer.get(id) as any;
+  if (!server) return ctx.reply(`Сервер ${id} не найден.`);
+
+  queries.setServerActive.run({ id, is_active: 1 });
+  await ctx.reply(`✅ Сервер "${server.name}" включён.`);
+});
+
+bot.command('disable_server', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return;
+  const id = parseTelegramIdFromCommand(ctx.message.text);
+  if (id === null) return ctx.reply('Использование: /disable_server <id>');
+
+  const server = queries.getServer.get(id) as any;
+  if (!server) return ctx.reply(`Сервер ${id} не найден.`);
+
+  queries.setServerActive.run({ id, is_active: 0 });
+  await ctx.reply(`⛔ Сервер "${server.name}" отключён (новые пользователи не будут назначаться).`);
+});
+
+bot.command('reload_servers', async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID) return;
   try {
-    const { updated, image } = await proxy.updateAndRestart();
-    const status = updated ? '✅ Образ обновлён и контейнер перезапущен.' : '✅ Образ уже актуален, контейнер перезапущен.';
-    await ctx.reply(`${status}\n\`${image}\``, { parse_mode: 'Markdown' });
+    syncServers();
+    const servers = queries.getAllServers.all() as ServerRecord[];
+    await ctx.reply(`✅ Конфигурация серверов перезагружена. Серверов: ${servers.length}`);
   } catch (err: any) {
-    await ctx.reply(`❌ Ошибка обновления: ${err.message}`);
+    await ctx.reply(`❌ Ошибка: ${err.message}`);
   }
 });
 
@@ -736,90 +886,105 @@ bot.command('toggle_trial_notify', async (ctx) => {
 // Каждые 30 минут — проверка истёкших подписок
 cron.schedule('*/30 * * * *', async () => {
   console.log('[Cron] Проверка истёкших подписок...');
-  const expired = queries.getExpiredUsers.all() as any[];
+  const servers = queries.getActiveServers.all() as ServerRecord[];
+  const affectedServerIds = new Set<number>();
 
-  if (expired.length === 0) return;
+  for (const server of servers) {
+    const expired = queries.getExpiredUsersByServer.all(server.id) as any[];
+    if (expired.length === 0) continue;
 
-  for (const user of expired) {
-    queries.deactivateUser.run(user.telegram_id);
+    for (const user of expired) {
+      queries.deactivateUser.run(user.telegram_id);
+      try {
+        await bot.telegram.sendMessage(
+          user.telegram_id,
+          '⏰ Твоя подписка на прокси истекла.\n\nПродли через /tariffs чтобы продолжить пользоваться.'
+        );
+      } catch {
+        // Юзер мог заблокировать бота
+      }
+    }
 
-    // Уведомляем юзера
+    affectedServerIds.add(server.id);
+    await notifyAdmin(
+      `♻️ Сервер "${server.name}": истекло ${expired.length} подписок.`
+    );
+  }
+
+  // Перезапускаем только затронутые серверы
+  for (const serverId of affectedServerIds) {
     try {
-      await bot.telegram.sendMessage(
-        user.telegram_id,
-        '⏰ Твоя подписка на прокси истекла.\n\nПродли через /tariffs чтобы продолжить пользоваться.'
-      );
-    } catch {
-      // Юзер мог заблокировать бота
+      await proxy.restartWithSecrets(serverId);
+    } catch (err) {
+      console.error(`[Cron] Ошибка перезапуска сервера ${serverId}:`, err);
     }
   }
-
-  // Перезапускаем proxy без удалённых секретов
-  try {
-    await proxy.restartWithSecrets();
-  } catch (err) {
-    console.error('[Cron] Ошибка перезапуска:', err);
-  }
-
-  await notifyAdmin(
-    `♻️ Истекло ${expired.length} подписок.\n` +
-      `Пользователи уведомлены, proxy обновлён.`
-  );
 });
 
 // Каждые 5 минут — мониторинг RAM и здоровья
 cron.schedule('*/5 * * * *', async () => {
-  const ram = await proxy.getRAMUsage();
-  const running = await proxy.isContainerRunning();
-  const active = (queries.getActiveUsersCount.get() as any).count;
+  const servers = queries.getActiveServers.all() as ServerRecord[];
 
-  // RAM алерты
-  if (ram > RAM_STOP && !salesBlocked) {
-    salesBlocked = true;
-    salesBlockReason = 'ram';
-    await notifyAdmin(
-      `🔴 RAM ${ram}% > ${RAM_STOP}%!\nПродажи автоматически заблокированы.`
-    );
-  } else if (ram > RAM_WARN) {
-    // Не спамим — уведомляем не чаще раза в час
-    if (Date.now() - lastRamWarnNotified > 3600000) {
-      lastRamWarnNotified = Date.now();
-      await notifyAdmin(`🟡 RAM ${ram}% — приближаемся к лимиту.`);
+  for (const server of servers) {
+    const ram = await proxy.getRAMUsage(server.id);
+    const running = await proxy.isContainerRunning(server.id);
+    const activeOnServer = (queries.getActiveUsersCountByServer.get(server.id) as any).count;
+
+    // RAM алерты (блокировка продаж при любом критическом сервере)
+    if (ram > RAM_STOP && !salesBlocked) {
+      salesBlocked = true;
+      salesBlockReason = 'ram';
+      await notifyAdmin(
+        `🔴 Сервер "${server.name}": RAM ${ram}% > ${RAM_STOP}%!\nПродажи заблокированы.`
+      );
+    } else if (ram > RAM_WARN) {
+      const lastWarn = lastRamWarnNotified.get(server.id) || 0;
+      if (Date.now() - lastWarn > 3600000) {
+        lastRamWarnNotified.set(server.id, Date.now());
+        await notifyAdmin(`🟡 Сервер "${server.name}": RAM ${ram}%.`);
+      }
     }
-  } else if (ram < RAM_WARN && salesBlocked && salesBlockReason === 'ram') {
-    // Автоматически разблокируем если RAM снизилась
-    salesBlocked = false;
-    salesBlockReason = null;
-    await notifyAdmin(`🟢 RAM ${ram}%, продажи автоматически разблокированы.`);
+
+    // Проверка контейнера
+    if (!running && activeOnServer > 0) {
+      await notifyAdmin(`❌ Сервер "${server.name}": контейнер упал! Перезапускаю...`);
+      try {
+        await proxy.restartWithSecrets(server.id);
+        await notifyAdmin(`✅ Сервер "${server.name}": контейнер восстановлен.`);
+      } catch (err: any) {
+        await notifyAdmin(`❌ Сервер "${server.name}": не удалось перезапустить: ${err.message}`);
+      }
+    }
   }
 
-  // Проверка контейнера
-  if (!running && active > 0) {
-    await notifyAdmin('❌ Proxy контейнер упал! Пытаюсь перезапустить...');
-    try {
-      await proxy.restartWithSecrets();
-      await notifyAdmin('✅ Proxy контейнер восстановлен.');
-    } catch (err: any) {
-      await notifyAdmin(`❌ Не удалось перезапустить: ${err.message}`);
+  // Автоматическое разблокирование продаж, если все серверы в норме
+  if (salesBlocked && salesBlockReason === 'ram') {
+    const allOk = await Promise.all(
+      servers.map(async s => (await proxy.getRAMUsage(s.id)) < RAM_WARN)
+    );
+    if (allOk.every(Boolean)) {
+      salesBlocked = false;
+      salesBlockReason = null;
+      await notifyAdmin(`🟢 Все серверы в норме, продажи разблокированы.`);
     }
   }
 
   // Soft limit
-  if (active >= SOFT_LIMIT && active < MAX_USERS) {
-    // Уведомляем раз в час (не спамим)
+  const totalActive = getTotalActiveCount();
+  if (totalActive >= SOFT_LIMIT && totalActive < MAX_USERS) {
     const minute = new Date().getMinutes();
     if (minute < 5) {
-      await notifyAdmin(`⚠️ Активных юзеров: ${active}/${MAX_USERS}. Приближаемся к лимиту.`);
+      await notifyAdmin(`⚠️ Активных юзеров: ${totalActive}/${MAX_USERS}. Приближаемся к лимиту.`);
     }
   }
 });
 
-// Каждый день в 3:00 — перезапуск proxy (рекомендация из документации)
+// Каждый день в 3:00 — перезапуск всех proxy
 cron.schedule('0 3 * * *', async () => {
-  console.log('[Cron] Ежедневный перезапуск proxy...');
+  console.log('[Cron] Ежедневный перезапуск всех proxy...');
   try {
-    await proxy.restartWithSecrets();
-    console.log('[Cron] Proxy перезапущен.');
+    await proxy.restartAllServers();
+    console.log('[Cron] Все proxy перезапущены.');
   } catch (err) {
     console.error('[Cron] Ошибка ежедневного перезапуска:', err);
     await notifyAdmin('❌ Ошибка ежедневного перезапуска proxy!');
@@ -874,11 +1039,20 @@ bot.help((ctx) => {
 // ═══════════════════════════════════════════════
 
 export function startBot() {
+  // Синхронизируем серверы из конфигурации
+  syncServers();
+
+  const servers = queries.getAllServers.all() as ServerRecord[];
+
   bot.launch();
 
   console.log('🤖 Бот запущен!');
   console.log(`👑 Админ: ${ADMIN_ID}`);
-  console.log(`📦 Лимит: ${MAX_USERS} юзеров`);
+  console.log(`📦 Глобальный лимит: ${MAX_USERS} юзеров`);
+  console.log(`🖥 Серверов: ${servers.length}`);
+  for (const s of servers) {
+    console.log(`   ${s.name} [${s.type}] ${s.host}:${s.port} (макс: ${s.max_users})`);
+  }
   console.log(`🎁 Триал: ${TRIAL_ENABLED ? `${TRIAL_DAYS} дн, ${TRIAL_MAX_CONNECTIONS} устр.` : 'выключен'}`);
   console.log(`🔔 Уведомления о триале: ${trialNotifyEnabled ? 'включены' : 'отключены'}`);
 

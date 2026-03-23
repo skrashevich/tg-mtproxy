@@ -3,32 +3,30 @@ import { promisify } from 'util';
 import crypto from 'crypto';
 import { writeFile } from 'fs/promises';
 import { queries } from './database';
+import { ServerRecord } from './server-config';
 
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
 
-const CONTAINER = process.env.PROXY_CONTAINER || 'mtproxy';
-if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(CONTAINER)) {
-  throw new Error(`Invalid PROXY_CONTAINER name: ${CONTAINER}`);
+function validateContainerName(name: string): void {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(name)) {
+    throw new Error(`Invalid container name: ${name}`);
+  }
+}
+
+/** Экранирует строку для безопасного использования в одинарных кавычках shell */
+function shellEscape(s: string): string {
+  return s.replace(/'/g, "'\\''");
 }
 
 /**
- * ProxyManager управляет MTProto proxy контейнером.
+ * ProxyManager управляет несколькими MTProto proxy серверами.
  *
- * Стратегия: один контейнер telegrammessenger/proxy на одном порту,
- * все секреты передаются через переменную SECRET (через запятую).
- * При добавлении/удалении секрета — контейнер пересоздаётся.
- *
- * Это самый экономичный подход для 1 ГБ RAM.
+ * Поддерживает два типа серверов:
+ * - local: Docker на той же машине (команды напрямую)
+ * - remote: Docker на удалённом сервере (команды через SSH)
  */
 export class ProxyManager {
-  private serverIp: string;
-  private proxyPort: number;
-
-  constructor() {
-    this.serverIp = process.env.SERVER_IP || '127.0.0.1';
-    this.proxyPort = parseInt(process.env.PROXY_PORT || '443');
-  }
 
   /** Генерирует 16-байтный hex secret (32 символа) */
   generateSecret(): string {
@@ -36,161 +34,244 @@ export class ProxyManager {
   }
 
   /** Формирует tg:// ссылку для подключения */
-  buildLink(secret: string): string {
-    // dd-prefix для fake-TLS (обход DPI)
+  buildLink(secret: string, server: ServerRecord): string {
     const ddSecret = `dd${secret}`;
-    return `tg://proxy?server=${this.serverIp}&port=${this.proxyPort}&secret=${ddSecret}`;
+    return `tg://proxy?server=${server.host}&port=${server.port}&secret=${ddSecret}`;
   }
 
   /** Формирует t.me ссылку */
-  buildWebLink(secret: string): string {
+  buildWebLink(secret: string, server: ServerRecord): string {
     const ddSecret = `dd${secret}`;
-    return `https://t.me/proxy?server=${this.serverIp}&port=${this.proxyPort}&secret=${ddSecret}`;
+    return `https://t.me/proxy?server=${server.host}&port=${server.port}&secret=${ddSecret}`;
+  }
+
+  /** Выбирает наименее загруженный активный сервер */
+  selectBestServer(): ServerRecord | null {
+    return queries.getServerLoad.get() as ServerRecord | null;
+  }
+
+  /** Получает сервер по ID */
+  getServer(serverId: number): ServerRecord | null {
+    return queries.getServer.get(serverId) as ServerRecord | null;
+  }
+
+  /** Получает все серверы с нагрузкой */
+  getAllServerLoads(): ServerRecord[] {
+    return queries.getAllServerLoads.all() as ServerRecord[];
+  }
+
+  // ─── Выполнение Docker-команд ───
+
+  private buildSshArgs(server: ServerRecord): string[] {
+    const args = [
+      '-o', 'StrictHostKeyChecking=accept-new',
+      '-o', 'ConnectTimeout=10',
+    ];
+    if (server.ssh_key_path) {
+      args.push('-i', server.ssh_key_path);
+    }
+    if (server.ssh_port && server.ssh_port !== 22) {
+      args.push('-p', String(server.ssh_port));
+    }
+    args.push(server.ssh_host!);
+    return args;
+  }
+
+  private async execDocker(server: ServerRecord, args: string[], timeout = 15000): Promise<string> {
+    validateContainerName(server.container_name);
+
+    if (server.type === 'local') {
+      const { stdout } = await execFileAsync('docker', args, { timeout });
+      return stdout.trim();
+    }
+
+    // remote: выполняем через SSH
+    const sshArgs = this.buildSshArgs(server);
+    const dockerCmd = ['docker', ...args].map(a => `'${a.replace(/'/g, "'\\''")}'`).join(' ');
+    sshArgs.push(dockerCmd);
+
+    const { stdout } = await execFileAsync('ssh', sshArgs, { timeout: timeout + 10000 });
+    return stdout.trim();
+  }
+
+  private async execRemoteShell(server: ServerRecord, command: string, timeout = 15000): Promise<string> {
+    if (server.type === 'local') {
+      const { stdout } = await execAsync(command, { timeout });
+      return stdout.trim();
+    }
+
+    const sshArgs = this.buildSshArgs(server);
+    sshArgs.push(command);
+    const { stdout } = await execFileAsync('ssh', sshArgs, { timeout: timeout + 10000 });
+    return stdout.trim();
+  }
+
+  // ─── Управление контейнерами ───
+
+  /**
+   * Обновляет секреты и перезапускает контейнер конкретного сервера.
+   */
+  async restartWithSecrets(serverId: number): Promise<void> {
+    const server = this.getServer(serverId);
+    if (!server) throw new Error(`Сервер ${serverId} не найден`);
+
+    const activeUsers = queries.getActiveUsersByServer.all(serverId) as any[];
+    const secrets = activeUsers.map((u: any) => u.secret).filter(Boolean);
+
+    if (secrets.length === 0) {
+      console.log(`[ProxyManager] Сервер "${server.name}": нет активных секретов`);
+      return;
+    }
+
+    const secretsStr = secrets.join(',');
+    const container = server.container_name;
+
+    // Записываем секреты в файл volume
+    try {
+      const volumePath = await this.execDocker(
+        server,
+        ['inspect', '-f', '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}', container],
+        5000
+      );
+
+      if (volumePath) {
+        if (server.type === 'local') {
+          await writeFile(`${volumePath}/secret`, secretsStr);
+        } else {
+          await this.execRemoteShell(
+            server,
+            `echo '${shellEscape(secretsStr)}' > '${shellEscape(volumePath)}/secret'`,
+            5000
+          );
+        }
+      } else {
+        console.warn(`[ProxyManager] Сервер "${server.name}": volume path пуст`);
+      }
+    } catch (err: any) {
+      console.error(`[ProxyManager] Сервер "${server.name}": ошибка записи секретов:`, err.message);
+    }
+
+    // Быстрый restart
+    try {
+      await this.execDocker(server, ['restart', '-t', '1', container]);
+      console.log(`[ProxyManager] Сервер "${server.name}": рестарт с ${secrets.length} секретами`);
+    } catch (err: any) {
+      console.error(`[ProxyManager] Сервер "${server.name}": ошибка рестарта:`, err.message);
+      throw err;
+    }
+  }
+
+  /** Перезапускает все активные серверы */
+  async restartAllServers(): Promise<void> {
+    const servers = queries.getActiveServers.all() as ServerRecord[];
+    await Promise.allSettled(
+      servers.map(s => this.restartWithSecrets(s.id))
+    );
   }
 
   /**
-   * Пересоздаёт контейнер с обновлённым образом.
-   * Делает docker pull, stop, rm, run — секреты берёт из БД.
-   * Возвращает { updated: true } если образ изменился.
+   * Обновляет образ и пересоздаёт контейнер на конкретном сервере.
    */
-  async updateAndRestart(): Promise<{ updated: boolean; image: string }> {
-    // Определяем образ: из запущенного контейнера или из env/дефолта
+  async updateAndRestart(serverId: number): Promise<{ updated: boolean; image: string }> {
+    const server = this.getServer(serverId);
+    if (!server) throw new Error(`Сервер ${serverId} не найден`);
+
+    const container = server.container_name;
+
+    // Определяем образ
     let image: string;
     try {
-      const { stdout } = await execFileAsync(
-        'docker', ['inspect', '-f', '{{.Config.Image}}', CONTAINER],
-        { timeout: 5000 }
-      );
-      image = stdout.trim();
+      image = await this.execDocker(server, ['inspect', '-f', '{{.Config.Image}}', container], 5000);
     } catch {
       image = process.env.PROXY_IMAGE || 'ghcr.io/skrashevich/mtproxy:latest';
     }
 
-    // Запоминаем текущий digest до pull
-    const digestBefore = await this.getImageId(image);
+    const digestBefore = await this.getImageId(server, image);
 
-    // Тянем новый образ (может занять время)
-    console.log(`[ProxyManager] docker pull ${image}...`);
-    await execFileAsync('docker', ['pull', image], { timeout: 120000 });
+    console.log(`[ProxyManager] Сервер "${server.name}": docker pull ${image}...`);
+    await this.execDocker(server, ['pull', image], 120000);
 
-    const digestAfter = await this.getImageId(image);
+    const digestAfter = await this.getImageId(server, image);
     const updated = digestBefore !== digestAfter;
 
-    // Берём активные секреты
-    const activeUsers = queries.getAllActiveUsers.all() as any[];
-    const secrets = activeUsers.map((u) => u.secret).filter(Boolean);
+    const activeUsers = queries.getActiveUsersByServer.all(serverId) as any[];
+    const secrets = activeUsers.map((u: any) => u.secret).filter(Boolean);
 
     // Останавливаем и удаляем старый контейнер
-    try {
-      await execFileAsync('docker', ['stop', '-t', '5', CONTAINER], { timeout: 15000 });
-    } catch { /* контейнер мог не существовать */ }
-    try {
-      await execFileAsync('docker', ['rm', CONTAINER], { timeout: 5000 });
-    } catch { /* контейнер мог не существовать */ }
+    try { await this.execDocker(server, ['stop', '-t', '5', container]); } catch { /* ok */ }
+    try { await this.execDocker(server, ['rm', container], 5000); } catch { /* ok */ }
 
     if (secrets.length === 0) {
-      console.log('[ProxyManager] Нет активных секретов — контейнер не запущен');
+      console.log(`[ProxyManager] Сервер "${server.name}": нет активных секретов — контейнер не запущен`);
       return { updated, image };
     }
 
     const tag = process.env.PROXY_TAG || '';
     const args = [
       'run', '-d',
-      `--name=${CONTAINER}`,
+      `--name=${container}`,
       '--restart=always',
-      '-p', `${this.proxyPort}:443`,
-      '-v', `${CONTAINER}-config:/data`,
+      '-p', `${server.port}:443`,
+      '-v', `${container}-config:/data`,
       ...(tag ? ['-e', `TAG=${tag}`] : []),
       image,
     ];
 
-    await execFileAsync('docker', args, { timeout: 30000 });
+    await this.execDocker(server, args, 30000);
 
-    // Записываем актуальные секреты в volume после запуска контейнера
+    // Записываем секреты
     try {
-      const { stdout } = await execFileAsync(
-        'docker', ['inspect', '-f', '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}', CONTAINER],
-        { timeout: 5000 }
+      const volumePath = await this.execDocker(
+        server,
+        ['inspect', '-f', '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}', container],
+        5000
       );
-      const volumePath = stdout.trim();
 
       if (volumePath) {
-        await writeFile(`${volumePath}/secret`, secrets.join(','));
-        await execFileAsync('docker', ['restart', '-t', '1', CONTAINER], { timeout: 15000 });
+        if (server.type === 'local') {
+          await writeFile(`${volumePath}/secret`, secrets.join(','));
+        } else {
+          const secretsStr = secrets.join(',');
+          await this.execRemoteShell(
+            server,
+            `echo '${shellEscape(secretsStr)}' > '${shellEscape(volumePath)}/secret'`,
+            5000
+          );
+        }
+        await this.execDocker(server, ['restart', '-t', '1', container]);
       }
     } catch (err: any) {
-      console.error('[ProxyManager] Ошибка записи секретов при обновлении:', err.message);
+      console.error(`[ProxyManager] Сервер "${server.name}": ошибка записи секретов при обновлении:`, err.message);
     }
 
-    console.log(`[ProxyManager] Контейнер запущен: ${image} (${secrets.length} секретов)`);
-
+    console.log(`[ProxyManager] Сервер "${server.name}": контейнер запущен: ${image} (${secrets.length} секретов)`);
     return { updated, image };
   }
 
-  private async getImageId(image: string): Promise<string> {
+  private async getImageId(server: ServerRecord, image: string): Promise<string> {
     try {
-      const { stdout } = await execFileAsync(
-        'docker', ['image', 'inspect', '-f', '{{.Id}}', image],
-        { timeout: 5000 }
-      );
-      return stdout.trim();
+      return await this.execDocker(server, ['image', 'inspect', '-f', '{{.Id}}', image], 5000);
     } catch {
       return '';
     }
   }
 
-  /**
-   * Обновляет секреты и перезапускает контейнер.
-   * Записывает секреты в файл volume, затем быстрый restart (~1-2 сек).
-   */
-  async restartWithSecrets(): Promise<void> {
-    const activeUsers = queries.getAllActiveUsers.all() as any[];
-    const secrets = activeUsers.map((u) => u.secret).filter(Boolean);
+  // ─── Мониторинг ───
 
-    if (secrets.length === 0) {
-      console.log('[ProxyManager] Нет активных секретов');
-      return;
-    }
-
-    const secretsStr = secrets.join(',');
-
-    // Пишем секреты в файл volume
-    try {
-      const { stdout } = await execFileAsync(
-        'docker', ['inspect', '-f', '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}', CONTAINER],
-        { timeout: 5000 }
-      );
-      const volumePath = stdout.trim();
-
-      if (volumePath) {
-        await writeFile(`${volumePath}/secret`, secretsStr);
-      } else {
-        console.warn('[ProxyManager] Volume path пуст — секреты не записаны');
-      }
-    } catch (err: any) {
-      console.error('[ProxyManager] Ошибка записи секретов:', err.message);
-    }
-
-    // Быстрый restart (1-2 сек)
-    try {
-      await execFileAsync('docker', ['restart', '-t', '1', CONTAINER], { timeout: 15000 });
-      console.log(`[ProxyManager] Рестарт с ${secrets.length} секретами`);
-    } catch (err: any) {
-      console.error('[ProxyManager] Ошибка рестарта:', err.message);
-      throw err;
-    }
-  }
-
-  /** Получает статистику подключений из контейнера */
-  async getStats(): Promise<{
+  /** Получает статистику подключений с конкретного сервера */
+  async getStats(serverId: number): Promise<{
     connections: number;
     maxConnections: number;
     secretConnections: Record<number, number>;
   } | null> {
+    const server = this.getServer(serverId);
+    if (!server) return null;
+
     try {
-      const { stdout } = await execFileAsync(
-        'docker', ['exec', CONTAINER, 'curl', '-s', 'http://localhost:2398/stats'],
-        { timeout: 5000 }
+      const stdout = await this.execDocker(
+        server,
+        ['exec', server.container_name, 'curl', '-s', 'http://localhost:2398/stats'],
+        5000
       );
 
       const lines = stdout.split('\n');
@@ -226,26 +307,34 @@ export class ProxyManager {
   }
 
   /** Проверяет здоровье контейнера */
-  async isContainerRunning(): Promise<boolean> {
+  async isContainerRunning(serverId: number): Promise<boolean> {
+    const server = this.getServer(serverId);
+    if (!server) return false;
+
     try {
-      const { stdout } = await execFileAsync(
-        'docker', ['inspect', '-f', '{{.State.Running}}', CONTAINER],
-        { timeout: 5000 }
+      const result = await this.execDocker(
+        server,
+        ['inspect', '-f', '{{.State.Running}}', server.container_name],
+        5000
       );
-      return stdout.trim() === 'true';
+      return result === 'true';
     } catch {
       return false;
     }
   }
 
-  /** Получает использование RAM в процентах */
-  async getRAMUsage(): Promise<number> {
+  /** Получает использование RAM (только для local серверов, для remote — через SSH) */
+  async getRAMUsage(serverId: number): Promise<number> {
+    const server = this.getServer(serverId);
+    if (!server) return 0;
+
     try {
-      const { stdout } = await execAsync(
+      const stdout = await this.execRemoteShell(
+        server,
         "free | awk '/Mem:/ {printf \"%.0f\", $3/$2 * 100}'",
-        { timeout: 3000 }
+        3000
       );
-      return parseInt(stdout.trim()) || 0;
+      return parseInt(stdout) || 0;
     } catch {
       return 0;
     }
