@@ -631,15 +631,21 @@ bot.command('unblock', async (ctx) => {
 
 bot.command('extend', async (ctx) => {
   if (ctx.from.id !== ADMIN_ID) return;
-  const parts = ctx.message.text.split(/\s+/);
-  const tgId = Number.parseInt(parts[1], 10);
-  const days = Number.parseInt(parts[2], 10);
-  if (Number.isNaN(tgId) || Number.isNaN(days) || days <= 0) {
-    return ctx.reply('Использование: /extend <telegram_id> <дней>');
+  const tgId = parseTelegramIdFromCommand(ctx.message.text);
+  const days = Number.parseInt((ctx.message.text || '').split(/\s+/)[2], 10);
+  if (tgId === null || Number.isNaN(days) || days <= 0 || days > 3650) {
+    return ctx.reply('Использование: /extend <telegram_id> <дней> (1–3650)');
   }
 
   const user = queries.getUser.get(tgId) as any;
   if (!user) return ctx.reply(`Пользователь ${tgId} не найден.`);
+
+  if (!user.is_active) {
+    const { canActivate } = getCapacityState(tgId);
+    if (!canActivate) {
+      return ctx.reply(`😔 Все места заняты (${MAX_USERS}/${MAX_USERS}). Сначала освободите место.`);
+    }
+  }
 
   // Если активен — прибавляем дни к текущей дате истечения, иначе — от сейчас
   const baseDate = user.is_active
@@ -650,6 +656,7 @@ bot.command('extend', async (ctx) => {
   try {
     queries.extendSubscription.run({ telegram_id: tgId, expires_at: expiresAt });
 
+    // Активный пользователь: секрет не изменился, рестарт не нужен
     if (!user.is_active) {
       await proxy.restartWithSecrets();
     }
